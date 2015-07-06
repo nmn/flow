@@ -992,11 +992,9 @@ and statement_decl cx = Ast.Statement.(
   let variable_declaration cx loc { VariableDeclaration.declarations; kind } =
     match kind with
     | VariableDeclaration.Const ->
-        let msg = "Unsupported variable declaration: const" in
-        Flow_js.add_error cx [mk_reason "" loc, msg]
+        List.iter (var_declarator cx) declarations
     | VariableDeclaration.Let ->
-        let msg = "Unsupported variable declaration: let" in
-        Flow_js.add_error cx [mk_reason "" loc, msg]
+        List.iter (var_declarator cx) declarations
     | VariableDeclaration.Var ->
         List.iter (var_declarator cx) declarations
   in
