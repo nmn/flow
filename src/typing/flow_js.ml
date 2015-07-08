@@ -299,13 +299,9 @@ and havoc_ctx_ = function
   | scope::scopes, frame1::stack1, frame2::stack2
     when frame1 = frame2 ->
     (if modes.verbose then prerr_endlinef "HAVOC::%d" frame1);
-    scope |> Scope.(update (
-      fun name { specific; general; def_loc; for_type } ->
-        (* internal names (.this, .super, .return, .exports) are read-only *)
-        if is_internal_name name
-        then create_entry ~for_type specific general def_loc
-        else create_entry ~for_type general general def_loc
-      ));
+    scope |> Scope.(update_opt
+      (havoc_entry ~make_specific:(fun general -> general))
+    );
     havoc_ctx_ (scopes, stack1, stack2)
   | _ -> ()
 
@@ -1388,11 +1384,16 @@ let rec __flow cx (l, u) trace =
        polymorphic definitions.) *)
     not_expect_bound l; not_expect_bound u;
 
-    (if modes.verbose
-     then prerr_endlinef
-        "\n# (%d) %s ~>\n# %s"
+    (if modes.verbose then
+      let indent = if modes.verbose_indent
+        then String.make ((trace_depth trace - 1) * 2) ' '
+        else "" in
+      prerr_endlinef
+        "\n%s# (%d) %s ~>\n%s# %s"
+        indent
         (Unix.getpid ())
         (dump_reason (reason_of_t l))
+        indent
         (dump_reason (reason_of_t u)));
 
     if ground_subtype (l,u) then ()

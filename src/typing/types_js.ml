@@ -34,6 +34,7 @@ type results = SSet.t * string list * Errors_js.error list list
 let init_modes opts = Options.(
   modes.debug <- opts.opt_debug;
   modes.verbose <- opts.opt_verbose;
+  modes.verbose_indent <- should_indent_verbose opts;
   modes.all <- opts.opt_all;
   modes.weak_by_default <- opts.opt_weak;
   modes.traces <- opts.opt_traces;
@@ -111,11 +112,6 @@ let save_errormap mapref errmap =
   SMap.iter (fun file errset ->
     mapref := SMap.add file errset !mapref
   ) errmap
-
-(* quick exception format *)
-let fmt_exc file exc =
-  file ^ ": " ^ (Printexc.to_string exc) ^ "\n"
-    ^ (Printexc.get_backtrace ())
 
 (* distribute errors from a set into a filename-indexed map,
    based on position info contained in error, not incoming key *)
@@ -276,7 +272,7 @@ let infer_job opts (inferred, errsets, errsuppressions) files =
       )
     with exc ->
       prerr_endlinef "(%d) infer_job THROWS: %s"
-        (Unix.getpid()) (fmt_exc file exc);
+        (Unix.getpid()) (fmt_file_exc file exc);
       inferred, errsets, errsuppressions
   ) (inferred, errsets, errsuppressions) files
 
@@ -445,7 +441,7 @@ let merge_strict_job opts (merged, errsets) files =
       )
     with exc ->
       prerr_endlinef "(%d) merge_strict_job THROWS: %s\n"
-        (Unix.getpid()) (fmt_exc file exc);
+        (Unix.getpid()) (fmt_file_exc file exc);
       (merged, errsets)
   ) (merged, errsets) files
 
@@ -491,7 +487,7 @@ let merge_nonstrict partition opts =
         with exc ->
           let files = Printf.sprintf "\n%s\n" (String.concat "\n" file_list) in
           prerr_endlinef "(%d) merge_module THROWS: %s\n"
-            (Unix.getpid()) (fmt_exc files exc);
+            (Unix.getpid()) (fmt_file_exc files exc);
           acc
       ) ([], []) partition in
       (* typecheck intrinsics--temp code *)
