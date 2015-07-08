@@ -3176,12 +3176,6 @@ and expression_ ~is_cond cx loc e = Ast.Expression.(match e with
   | Call {
       Call.callee = _, Identifier (_, { Ast.Identifier.name = "merge"; _ });
       arguments
-    }
-      (* TODO: require *)
-  | Call {
-      Call.callee = _, Identifier (_,
-        { Ast.Identifier.name = "mergeObjects"; _ });
-      arguments
     } ->
       (* TODO: require *)
       let argts = List.map (expression_or_spread cx) arguments in
@@ -5646,7 +5640,7 @@ let aggregate_context_data cx cx_other =
 
 (* update module graph with other module graph *)
 let update_graph cx cx_other =
-  let _, builtin_id = open_tvar Flow_js.builtins in
+  let _, builtin_id = open_tvar (Flow_js.builtins ()) in
   let master_node = IMap.find_unsafe builtin_id cx.graph in
   let master_bounds = bounds_of_unresolved_root master_node in
   cx_other.graph |> IMap.iter (fun id module_node ->
@@ -5669,10 +5663,11 @@ type direction = Out | In
  * in the master context, and create a flow between the two types
  * in the direction specified *)
 let link_module_types dir cx m =
-  let glo = exports Flow_js.master_cx m in
+  let master_cx = Flow_js.master_cx () in
+  let glo = exports master_cx m in
   let loc = Flow_js.lookup_module cx m in
   let edge = match dir with Out -> (glo, loc) | In -> (loc, glo) in
-  Flow_js.flow Flow_js.master_cx edge
+  Flow_js.flow master_cx edge
 
 (* map an exported module type from context to master *)
 let export_to_master cx m =
@@ -5688,15 +5683,16 @@ let copy_context cx cx_other =
   update_graph cx cx_other
 
 let copy_context_master cx =
-  copy_context Flow_js.master_cx cx
+  copy_context (Flow_js.master_cx ()) cx
 
 (* Connect the builtins object in master_cx to the builtins reference in some
    arbitrary cx. *)
 let implicit_require_strict cx master_cx =
-  let _, builtin_id = open_tvar Flow_js.builtins in
+  let builtins = Flow_js.builtins () in
+  let _, builtin_id = open_tvar builtins in
   let types = Flow_js.possible_types master_cx builtin_id in
   types |> List.iter (fun t ->
-    Flow_js.flow cx (t, Flow_js.builtins)
+    Flow_js.flow cx (t, builtins)
   )
 
 (* Connect the export of cx_from to its import in cx_to. This happens in some
@@ -5794,5 +5790,5 @@ let merge_module_list cx_list =
       )
   ) in
   (* cross-module garbage collection *)
-  cross_module_gc Flow_js.master_cx modules requires;
+  cross_module_gc (Flow_js.master_cx ()) modules requires;
   ()
