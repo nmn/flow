@@ -165,6 +165,8 @@ module Naming                               = struct
   let return_only_typehint                  = 2063 (* DONT MODIFY!!!! *)
   let unexpected_type_arguments             = 2064 (* DONT MODIFY!!!! *)
   let too_many_type_arguments               = 2065 (* DONT MODIFY!!!! *)
+  let classname_param                       = 2066 (* DONT MODIFY!!!! *)
+
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
 
@@ -530,6 +532,11 @@ let lowercase_this pos type_ =
   "Invalid Hack type \""^type_^"\". Use \"this\" instead"
  )
 
+let classname_param pos =
+  add Naming.classname_param pos
+    ("Missing type parameter to classname; classname is entirely"
+     ^" meaningless without one")
+
 let tparam_with_tparam pos x =
   add Naming.tparam_with_tparam pos (
   Printf.sprintf "%s is a type parameter. Type parameters cannot \
@@ -874,7 +881,7 @@ let member_not_implemented member_name parent_pos pos defn_pos =
   let msg3 = defn_pos, "As defined here" in
   add_list Typing.member_not_implemented [msg1; msg2; msg3]
 
-let override parent_pos parent_name pos name (error: error) =
+let bad_decl_override parent_pos parent_name pos name (error: error) =
   let msg1 = pos, ("This object is of type "^(strip_ns name)) in
   let msg2 = parent_pos,
     ("It is incompatible with this object of type "^(strip_ns parent_name)^
@@ -1184,11 +1191,14 @@ let self_outside_class pos =
   add Typing.self_outside_class pos
     "'self' is undefined outside of a class"
 
-let new_static_inconsistent new_pos (cpos, cname) =
+let new_inconsistent_construct new_pos (cpos, cname) kind =
   let name = Utils.strip_ns cname in
+  let preamble = match kind with
+    | `static -> "Can't use new static() for "^name
+    | `classname -> "Can't use new on classname<"^name^">"
+  in
   add_list Typing.new_static_inconsistent [
-    new_pos, "Can't use new static() for "^name^
-  "; __construct arguments are not \
+    new_pos, preamble^"; __construct arguments are not \
     guaranteed to be consistent in child classes";
     cpos, ("This declaration neither defines an abstract/final __construct"
            ^" nor uses <<__ConsistentConstruct>> attribute")]

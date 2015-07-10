@@ -56,6 +56,20 @@ let rec is_option env ty =
       List.exists (is_option env) tyl
   | _ -> false
 
+let is_class ty = match snd ty with
+  | Tclass _ -> true
+  | _ -> false
+
+(*****************************************************************************)
+(* Gets the base type of an abstract type *)
+(*****************************************************************************)
+
+let rec get_base_type ty = match snd ty with
+  | Tabstract (AKnewtype (classname, _), _) when
+      classname = SN.Classes.cClassname -> ty
+  | Tabstract (_, Some ty) -> get_base_type ty
+  | _ -> ty
+
 (*****************************************************************************)
 (* Unification error *)
 (*****************************************************************************)
