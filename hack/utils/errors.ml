@@ -344,6 +344,7 @@ module Typing                               = struct
   let invalid_shape_remove_key              = 4139 (* DONT MODIFY!!!! *)
   let missing_optional_field                = 4140 (* DONT MODIFY!!!! *)
   let shape_field_unset                     = 4141 (* DONT MODIFY!!!! *)
+  let abstract_concrete_override            = 4142 (* DONT MODIFY!!!! *)
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
 
@@ -521,11 +522,10 @@ let this_hint_outside_class pos =
    add Naming.this_hint_outside_class pos
     "Cannot use \"this\" outside of a class"
 
-let this_must_be_return pos =
-  add Naming.this_must_be_return pos
-    "The type \"this\" can only be used as a return type, \
-     to instantiate a covariant type variable, \
-     or as a private non-static member variable"
+let this_type_forbidden pos =
+ add Naming.this_must_be_return pos
+    "The type \"this\" cannot be used as a constraint on a class' generic, \
+     or as the type of a static member variable"
 
 let lowercase_this pos type_ =
   add Naming.lowercase_this pos (
@@ -1471,6 +1471,14 @@ let this_final id pos2 (error: error) =
   let code, msgl = error in
   add_list code (msgl @ [(fst id, message1); (pos2, message2)])
 
+let exact_class_final id pos2 (error: error) =
+  let n = Utils.strip_ns (snd id) in
+  let message1 = "This requires the late-bound type to be exactly "^n in
+  let message2 =
+    "Since " ^n^" is not final this might be an instance of a child class" in
+  let code, msgl = error in
+  add_list code (msgl @ [(fst id, message1); (pos2, message2)])
+
 let tuple_arity_mismatch pos1 n1 pos2 n2 =
   add_list Typing.tuple_arity_mismatch [
   pos1, "This tuple has "^n1^" elements";
@@ -1559,6 +1567,12 @@ let cyclic_typeconst pos sl =
 
 let this_lvalue pos =
   add Typing.this_lvalue pos "Cannot assign a value to $this"
+
+let abstract_concrete_override pos parent_pos tconst_name =
+  add_list Typing.abstract_concrete_override ([
+    pos, "Cannot re-declare member " ^ tconst_name ^ " as abstract";
+    parent_pos, "Previously defined here"
+  ])
 
 (*****************************************************************************)
 (* Typing decl errors *)
@@ -1724,7 +1738,7 @@ let to_string ((error_code, msgl) : Pos.absolute error_) : string =
 (* Try if errors. *)
 (*****************************************************************************)
 
-let try_ f1 f2 =
+let try_with_result f1 f2 =
   let error_list_copy = !error_list in
   let accumulate_errors_copy = !accumulate_errors in
   error_list := [];
@@ -1735,7 +1749,10 @@ let try_ f1 f2 =
   accumulate_errors := accumulate_errors_copy;
   match List.rev errors with
   | [] -> result
-  | l :: _ -> f2 l
+  | l :: _ -> f2 result l
+
+let try_ f1 f2 =
+  try_with_result f1 (fun _ l -> f2 l)
 
 let try_with_error f1 f2 =
   try_ f1 (fun err -> add_error err; f2())
@@ -1768,8 +1785,16 @@ let ignore_ f =
   snd (do_ f)
 
 let try_when f ~when_ ~do_ =
-  try_ f begin fun (error: error) ->
+  try_with_result f begin fun result (error: error) ->
     if when_()
     then do_ error
-    else add_error error
+    else add_error error;
+    result
   end
+
+(* Runs the first function that is expected to produce an error. If it doesn't
+ * then we run the second function we are given
+ *)
+let must_error f error_fun =
+  let had_no_errors = try_with_error (fun () -> f(); true) (fun _ -> false) in
+  if had_no_errors then error_fun();

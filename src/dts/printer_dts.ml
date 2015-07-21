@@ -267,10 +267,8 @@ and extract_module acc prefix = Statement.(function
 and get_name prefix = function
   | _ , { IdPath.ids; _} -> append_name prefix ids
 
-and append_name prefix = function
-  | [x] -> id_name prefix x
-  | _ -> failwith
-    "FLow only supports module declaration with one identifier"
+and append_name prefix =
+  function x -> String.concat "." (List.map (id_name prefix) x)
 
 and id_name prefix = function
   | _, { Identifier.name; _ } -> generate_mangled_name name prefix
@@ -390,6 +388,24 @@ and module_used_statement acc = Statement.(function
     let acc = module_used_body acc body in
     let fold_intermediate x y = module_used_generic x (snd y) in
     List.fold_left fold_intermediate acc extends
+  (* This case checks for function declaration's parameters and returnType.
+    Eg.,
+          export function f(x: M.C): typeof P.x
+    This would return "M" :: "P" :: []
+  *)
+  | _, AmbientFunctionDeclaration{ AmbientFunctionDeclaration. params;
+      returnType; _ } ->
+    let acc = module_used_type acc returnType in
+    let fold_intermediate x y = module_used_pattern x y in
+    List.fold_left fold_intermediate acc params
+  (* This case checks for TypeAliases
+    Eg.,
+          type A = number | M.C
+    This would return "M" :: []
+  *)
+  | _, TypeAlias {TypeAlias. right; _} ->
+    module_used_type acc right
+
   | _ -> acc
 )
 
@@ -410,6 +426,12 @@ and module_used_type acc = Type.(function
   | _, Typeof x ->
     (match x with _, {IdPath.ids; _}-> module_used_ids acc ids)
   | loc, Object t -> module_used_body acc (loc, t)
+  | _, Intersection l ->
+      let fold_intermediate x y = module_used_type x y in
+      List.fold_left fold_intermediate acc l
+  | _, Union l ->
+      let fold_intermediate x y = module_used_type x y in
+      List.fold_left fold_intermediate acc l
   | _ -> acc
 )
 
@@ -419,6 +441,7 @@ and module_used_generic acc = Type.(function
 )
 
 and module_used_ids acc = function
+  | [x] -> acc
   | x :: xs ->  ( match x with
     | _, {Identifier. name; _ } -> SSet.add name acc
   )
@@ -764,10 +787,9 @@ and statement scope prefix fmt =
       )
   (* The following handles type aliases.
      Eg. : type T = number | string;
-     TODO: walk through typealiases while computing module_used etc.
   *)
   | (loc, TypeAlias {TypeAlias.left; right } ), _ ->
-    fprintf fmt "@[<hv>type %a = %a;@]"
+    fprintf fmt "@[<hv>declare type %a = %a;@]"
       generic_type (snd left)
       type_ right
 
