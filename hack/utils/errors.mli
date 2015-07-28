@@ -167,7 +167,8 @@ val extend_final : Pos.t -> Pos.t -> string -> unit
 val read_before_write : Pos.t * string -> unit
 val interface_final : Pos.t -> unit
 val trait_final : Pos.t -> unit
-val implement_abstract : Pos.t -> Pos.t -> string -> string -> unit
+val implement_abstract :
+  is_final:bool -> Pos.t -> Pos.t -> string -> string -> unit
 val generic_static : Pos.t -> string -> unit
 val fun_too_many_args : Pos.t -> Pos.t -> unit
 val fun_too_few_args : Pos.t -> Pos.t -> unit
@@ -276,7 +277,11 @@ val ambiguous_inheritance: Pos.t -> string -> string -> error -> unit
 val cyclic_typeconst : Pos.t -> string list -> unit
 val explain_contravariance : Pos.t -> string -> error -> unit
 val this_lvalue : Pos.t -> unit
-val abstract_concrete_override : Pos.t -> Pos.t -> string -> unit
+val abstract_concrete_override:
+  Pos.t -> Pos.t -> [< `method_ | `typeconst |`constant]-> unit
+val local_variable_modified_and_used : Pos.t -> Pos.t list -> unit
+val local_variable_modified_twice : Pos.t -> Pos.t list -> unit
+val assign_during_case : Pos.t -> unit
 
 val to_json : Pos.absolute error_ -> Hh_json.json
 val to_string : Pos.absolute error_ -> string

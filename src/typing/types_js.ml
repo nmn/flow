@@ -44,6 +44,7 @@ let init_modes opts = Options.(
   modes.quiet <- opts.opt_quiet;
   modes.profile <- opts.opt_profile;
   modes.no_flowlib <- opts.opt_no_flowlib;
+  modes.munge_underscores <- opts.opt_munge_underscores;
   (* TODO: confirm that only master uses strip_root, otherwise set it! *)
   Module_js.init opts;
   Files_js.init opts.opt_libs
@@ -417,7 +418,7 @@ let merge_strict_file file =
   (* always use cache to read contexts, instead of directly
      using ContextHeap; otherwise bad things will happen. *)
   let cx = cache#read file in
-  let master_cx = cache#read (Files_js.get_flowlib_root ()) in
+  let master_cx = cache#read Files_js.global_file_name in
   merge_strict_context cache cx master_cx
 
 let typecheck_contents contents filename =
@@ -425,7 +426,7 @@ let typecheck_contents contents filename =
   | OK ast ->
       let cx = TI.infer_ast ast filename true in
       let cache = new context_cache in
-      let master_cx = cache#read (Files_js.get_flowlib_root ()) in
+      let master_cx = cache#read Files_js.global_file_name in
       Some (merge_strict_context cache cx master_cx), cx.errors
   | Err errors ->
       None, errors

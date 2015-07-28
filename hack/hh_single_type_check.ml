@@ -26,7 +26,6 @@ type mode =
   | Lint
   | Prolog
   | Suggest
-  | Emit
 
 type options = {
   filename : string;
@@ -134,7 +133,10 @@ let builtins = "<?hh // decl\n"^
   "  public static function removeKey(shape() $shape, arraykey $index): void {}\n" ^
   "}\n" ^
   "newtype classname<+T> = string;\n" ^
-  "function var_dump($x): void;\n"
+  "function var_dump($x): void;\n" ^
+  "function gena();\n" ^
+  "function genva();\n" ^
+  "function gen_array_rec();\n"
 
 (*****************************************************************************)
 (* Helpers *)
@@ -173,9 +175,6 @@ let parse_options () =
     "--dump-symbol-info",
       Arg.Unit (set_mode DumpSymbolInfo),
       "Dump all symbol information";
-    "--emit",
-      Arg.Unit (set_mode Emit),
-      "Emit HHVM assembly";
     "--lint",
       Arg.Unit (set_mode Lint),
       "Produce lint errors";
@@ -228,7 +227,14 @@ let rec make_files = function
       (filename, content) :: make_files rl
   | _ -> assert false
 
-let parse_file file =
+(* We have some hacky "syntax extensions" to have one file contain multiple
+ * files, which can be located at arbitrary paths. This is useful e.g. for
+ * testing lint rules, some of which activate only on certain paths. It's also
+ * useful for testing abstract types, since the abstraction is enforced at the
+ * file boundary.
+ * Takes the path to a single file, returns a map of filenames to file contents.
+ *)
+let file_to_files file =
   let abs_fn = Relative_path.to_absolute file in
   let content = cat abs_fn in
   let delim = Str.regexp "////.*" in
@@ -239,7 +245,7 @@ let parse_file file =
     List.fold_left begin fun acc (sub_fn, content) ->
       let file =
         Relative_path.create Relative_path.Dummy (abs_fn^"--"^sub_fn) in
-      Relative_path.Map.add file (Parser_hack.program file content) acc
+      Relative_path.Map.add file content acc
     end Relative_path.Map.empty files
   else if str_starts_with content "// @directory " then
     let contentl = Str.split (Str.regexp "\n") content in
@@ -250,9 +256,9 @@ let parse_file file =
     let dir = Str.matched_group 1 first_line in
     let file = Relative_path.create Relative_path.Dummy (dir ^ abs_fn) in
     let content = String.concat "\n" (List.tl contentl) in
-    Relative_path.Map.singleton file (Parser_hack.program file content)
+    Relative_path.Map.singleton file content
   else
-    Relative_path.Map.singleton file (Parser_hack.program file content)
+    Relative_path.Map.singleton file content
 
 (* Make readable test output *)
 let replace_color input =
@@ -280,7 +286,7 @@ let print_prolog nenv files_info =
   end files_info [] in
   PrologMain.output_facts stdout facts
 
-let handle_mode mode filename nenv files_info errors lint_errors ai_results =
+let handle_mode mode filename nenv files_contents files_info errors ai_results =
   match mode with
   | Ai -> ()
   | Autocomplete ->
@@ -319,11 +325,11 @@ let handle_mode mode filename nenv files_info errors lint_errors ai_results =
       end
   | Lint ->
       let lint_errors =
-        Relative_path.Map.fold begin fun fn fileinfo lint_errors ->
+        Relative_path.Map.fold begin fun fn content lint_errors ->
           lint_errors @ fst (Lint.do_ begin fun () ->
-            Linting_service.lint fn fileinfo
+            Linting_service.lint fn content
           end)
-        end files_info lint_errors in
+        end files_contents [] in
       if lint_errors <> []
       then begin
         let lint_errors = List.sort begin fun x y ->
@@ -337,7 +343,6 @@ let handle_mode mode filename nenv files_info errors lint_errors ai_results =
   | Prolog ->
       print_prolog nenv files_info
   | Suggest
-  | Emit
   | Errors ->
       let errors = Relative_path.Map.fold begin fun _ fileinfo errors ->
         errors @ Typing_check_utils.check_defs nenv fileinfo
@@ -346,12 +351,7 @@ let handle_mode mode filename nenv files_info errors lint_errors ai_results =
       then Relative_path.Map.iter (suggest_and_print nenv) files_info;
       if errors <> []
       then (error (List.hd errors); exit 2)
-      else
-        if mode = Emit then
-          Relative_path.Map.fold begin fun _ fileinfo output ->
-            Emitter.emit_file nenv fileinfo output
-          end files_info ()
-        else Printf.printf "No errors\n"
+      else Printf.printf "No errors\n"
 
 (*****************************************************************************)
 (* Main entry point *)
@@ -362,20 +362,22 @@ let main_hack { filename; mode; } =
   EventLogger.init (Daemon.devnull ()) 0.0;
   SharedMem.(init default_config);
   Hhi.set_hhi_root_for_unit_test (Path.make "/tmp/hhi");
-  if mode = Emit then Ident.track_names := true; (* <- frumious hack. *)
   let outer_do f = match mode with
     | Ai ->
-       let ai_results, inner_results =
-         Ai.do_ Typing_check_utils.check_defs filename in
-       ai_results, [], inner_results
+        let ai_results, inner_results =
+          Ai.do_ Typing_check_utils.check_defs filename in
+        ai_results, inner_results
     | _ ->
-       let lint_results, inner_results = Lint.do_ f in
-       [], lint_results, inner_results in
+        let inner_results = f () in
+        [], inner_results
+  in
   let filename = Relative_path.create Relative_path.Dummy filename in
-  let ai_results, lint_errors, (errors, (nenv, files_info)) =
+  let files_contents = file_to_files filename in
+  let ai_results, (errors, (nenv, files_info)) =
     outer_do begin fun () ->
       Errors.do_ begin fun () ->
-        let parsed_files = parse_file filename in
+        let parsed_files =
+          Relative_path.Map.mapi Parser_hack.program files_contents in
         let parsed_builtins = Parser_hack.program builtins_filename builtins in
         let parsed_files =
           Relative_path.Map.add builtins_filename parsed_builtins parsed_files
@@ -411,7 +413,7 @@ let main_hack { filename; mode; } =
         nenv, files_info
       end
     end in
-  handle_mode mode filename nenv files_info errors lint_errors ai_results
+  handle_mode mode filename nenv files_contents files_info errors ai_results
 
 (* command line driver *)
 let _ =

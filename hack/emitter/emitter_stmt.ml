@@ -46,28 +46,6 @@ let with_targets env continue_target break_target f arg =
   with_actions env nonlocal f arg
 
 
-(* Some stuff for managing faultlets/fault regions *)
-let make_opt_faultlet env need_faultlet =
-  if need_faultlet then
-  let env, label = fresh_faultlet env in env, Some label else
-  env, None
-
-let emit_fault_enter env label = emit_enter env ".try_fault" [] label ""
-
-let emit_fault_exit env _ = emit_exit env
-
-let emit_fault_cleanup ?faultlet_extras:(extra=(fun env -> env))
-                       ~cleanup:f
-                       env label =
-  let env = f env in
-  let emit_faultlet env =
-    let env = emit_label env label in
-    let env = extra env in
-    let env = f env in
-    emit_Unwind env
-  in
-  add_cleanup env emit_faultlet
-
 let is_empty_block = function
   | [] | [N.Noop] -> true
   | _ -> false
@@ -193,7 +171,7 @@ and emit_stmt env stmt =
       | N.As_v (_, N.Lvar id) -> env, [get_lid_name id]
       | N.As_kv ((_, N.Lvar id1), (_, N.Lvar id2)) ->
         env, [get_lid_name id2; get_lid_name id1]
-      | _ -> unimpl "await bindings"; assert false
+      | _ -> unimpl "await bindings"
     in
 
     let env = emit_IterInit env iter break_label id in
@@ -269,7 +247,7 @@ and emit_stmt env stmt =
       let emit_catch i env (label, (_, var, body)) =
         let env = emit_label env label in
         let env = emit_Catch env in
-        let env = emit_Set env (Llocal var) in
+        let env = emit_Set env (llocal var) in
         let env = emit_PopC env in
         let env, _ = emit_block env body in
         (* want to be able to skip the jump on the last one *)
@@ -398,18 +376,7 @@ and emit_stmt env stmt =
     end cases in
 
     (* If the expr isn't a local, make a temp local and assign to it *)
-    let env, need_cleanup, id =
-      match e with
-      | _, N.Lvar id -> env, false, get_lid_name id
-      | _ ->
-        let env = Emitter_expr.emit_expr env e in
-        let env, id = fresh_tempvar env in
-        let env = emit_SetL env id in
-        let env = emit_PopC env in
-        env, true, id
-    in
-    let env, opt_faultlet = make_opt_faultlet env need_cleanup in
-
+    let env, opt_faultlet, id = Emitter_expr.emit_expr_to_var env e in
     let env = opt_fold emit_fault_enter env opt_faultlet in
 
     let env, end_label = fresh_label env in
@@ -447,4 +414,4 @@ and emit_stmt env stmt =
 
     env, false
 
-  | N.Static_var _ -> unimpl "static variable"; assert false
+  | N.Static_var _ -> unimpl "static variables"

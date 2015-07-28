@@ -334,6 +334,7 @@ and check_param env param (_, ty) =
 
 and bind_param env (_, ty1) param =
   let env, ty2 = opt expr env param.param_expr in
+  Option.iter param.param_expr Typing_sequencing.sequence_check_expr;
   let ty2 = match ty2 with
     | None    -> Reason.none, Tany
     | Some ty -> ty
@@ -393,6 +394,7 @@ and fun_ ?(abstract=false) env hret pos named_body f_kind =
     let env = Env.set_return env hret in
     let env = Env.set_fn_kind env f_kind in
     let env = block env named_body.fnb_nast in
+    Typing_sequencing.sequence_check_block named_body.fnb_nast;
     let ret = Env.get_return env in
     let env =
       if Nast_terminality.Terminal.block named_body.fnb_nast ||
@@ -1378,6 +1380,7 @@ and anon_bind_opt_param env param =
       bind_param env (None, ty) param
   | Some default ->
       let env, ty = expr env default in
+      Typing_sequencing.sequence_check_expr default;
       bind_param env (None, ty) param
 
 and anon_check_param env param =
@@ -3474,11 +3477,11 @@ and condition env tparamet =
               (_, Null), e)
   | r, Binop ((Ast.Eqeq | Ast.EQeqeq as bop),
               e, (_, Null)) when not tparamet ->
-                let env, x_ty = expr env e in
-                let env, x_ty = Env.expand_type env x_ty in
-                let env =
-                  if bop == Ast.Eqeq then check_null_wtf env r x_ty else env in
-                condition_var_non_null env e
+      let env, x_ty = expr env e in
+      let env, x_ty = Env.expand_type env x_ty in
+      let env =
+        if bop == Ast.Eqeq then check_null_wtf env r x_ty else env in
+      condition_var_non_null env e
   | (p, (Lvar _ | Obj_get _ | Class_get _) as e) ->
       let env, ty = expr env e in
       let env, ety = Env.expand_type env ty in
@@ -3587,11 +3590,11 @@ and condition env tparamet =
       end
   | _, Binop ((Ast.Eqeq | Ast.EQeqeq), e, (_, Null))
   | _, Binop ((Ast.Eqeq | Ast.EQeqeq), (_, Null), e) ->
-    let env, _ = expr env e in
-    env
+      let env, _ = expr env e in
+      env
   | e ->
-    let env, _ = expr env e in
-    env
+      let env, _ = expr env e in
+      env
 
 and is_instance_var = function
   | _, (Lvar _ | This) -> true
@@ -3721,13 +3724,15 @@ and check_parent class_def class_type parent_type =
   else ()
 
 and check_parent_abstract position parent_type class_type =
+  let is_final = class_type.tc_final in
   if parent_type.tc_kind = Ast.Cabstract &&
-    class_type.tc_kind <> Ast.Cabstract
+    (class_type.tc_kind <> Ast.Cabstract || is_final)
   then begin
-    check_extend_abstract_meth position class_type.tc_methods;
-    check_extend_abstract_meth position class_type.tc_smethods;
-    check_extend_abstract_const position class_type.tc_consts;
-    check_extend_abstract_typeconst position class_type.tc_typeconsts;
+    check_extend_abstract_meth ~is_final position class_type.tc_methods;
+    check_extend_abstract_meth ~is_final position class_type.tc_smethods;
+    check_extend_abstract_const ~is_final position class_type.tc_consts;
+    check_extend_abstract_typeconst
+      ~is_final position class_type.tc_typeconsts;
   end else ()
 
 and class_def env_up nenv _ c =
@@ -3766,12 +3771,13 @@ and class_def_ env_up c tc =
   let self = get_self_from_c env c in
   List.iter (check_implements_tparaml env) impl;
   let env, parent = class_def_parent env c tc in
-  if tc.tc_kind = Ast.Cnormal && tc.tc_members_fully_known
+  let is_final = tc.tc_final in
+  if (tc.tc_kind = Ast.Cnormal || is_final) && tc.tc_members_fully_known
   then begin
-    check_extend_abstract_meth pc tc.tc_methods;
-    check_extend_abstract_meth pc tc.tc_smethods;
-    check_extend_abstract_const pc tc.tc_consts;
-    check_extend_abstract_typeconst pc tc.tc_typeconsts;
+    check_extend_abstract_meth ~is_final pc tc.tc_methods;
+    check_extend_abstract_meth ~is_final pc tc.tc_smethods;
+    check_extend_abstract_const ~is_final pc tc.tc_consts;
+    check_extend_abstract_typeconst ~is_final pc tc.tc_typeconsts;
   end;
   let env, self = Phase.localize_with_self env self in
   let env = Env.set_self env self in
@@ -3796,11 +3802,11 @@ and class_def_ env_up c tc =
   List.iter (method_def env) c.c_static_methods;
   Typing_hooks.dispatch_exit_class_def_hook c tc
 
-and check_extend_abstract_meth p smap =
+and check_extend_abstract_meth ~is_final p smap =
   SMap.iter begin fun x ce ->
     match ce.ce_type with
     | r, Tfun { ft_abstract = true; _ } ->
-        Errors.implement_abstract p (Reason.to_pos r) "method" x
+        Errors.implement_abstract ~is_final p (Reason.to_pos r) "method" x
     | _, (Tany | Tmixed | Tarray (_, _) | Tgeneric (_,_) | Toption _ | Tprim _
           | Tfun _ | Tapply (_, _) | Ttuple _ | Tshape _ | Taccess (_, _)
           | Tthis
@@ -3809,17 +3815,17 @@ and check_extend_abstract_meth p smap =
 
 (* Type constants must be bound to a concrete type for non-abstract classes.
  *)
-and check_extend_abstract_typeconst p smap =
+and check_extend_abstract_typeconst ~is_final p smap =
   SMap.iter begin fun x tc ->
     if tc.ttc_type = None then
-      Errors.implement_abstract p (fst tc.ttc_name) "type constant" x
+      Errors.implement_abstract ~is_final p (fst tc.ttc_name) "type constant" x
   end smap
 
-and check_extend_abstract_const p smap =
+and check_extend_abstract_const ~is_final p smap =
   SMap.iter begin fun x ce ->
     match ce.ce_type with
     | r, Tgeneric _ ->
-      Errors.implement_abstract p (Reason.to_pos r) "constant" x
+      Errors.implement_abstract ~is_final p (Reason.to_pos r) "constant" x
     | _, (Tany | Tmixed | Tarray (_, _) | Toption _ | Tprim _ | Tfun _
           | Tapply (_, _) | Ttuple _ | Tshape _ | Taccess (_, _) | Tthis
          ) -> ()
