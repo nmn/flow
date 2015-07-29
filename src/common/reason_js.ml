@@ -145,16 +145,20 @@ let json_of_loc loc = Json.(Loc.(
 
 (* reason constructors, accessors, etc. *)
 
-(* The current test_id is included in every new reason. *)
-let mk_reason desc loc = {
-  test_id = TestID.current();
+let mk_reason_with_test_id test_id desc loc = {
+  test_id;
   derivable = false;
   desc;
   loc;
 }
 
+(* The current test_id is included in every new reason. *)
+let mk_reason desc loc =
+  mk_reason_with_test_id (TestID.current()) desc loc
+
+(* Lift a string to a reason. Usually used as a dummy reason. *)
 let reason_of_string s =
-  mk_reason s Loc.none
+  mk_reason_with_test_id None s Loc.none
 
 let loc_of_reason r = r.loc
 
@@ -201,8 +205,11 @@ let derivable_reason r =
   { r with derivable = true }
 
 let builtin_reason x =
-  mk_reason x Loc.({ none with source = Some (Files_js.get_flowlib_root ()) })
+  mk_reason x Loc.({ none with source = Some Files_js.global_file_name })
   |> derivable_reason
+
+let is_builtin_reason r =
+  r.loc.Loc.source = Some Files_js.global_file_name
 
 (* reasons compare on their locations *)
 let compare r1 r2 =
@@ -237,16 +244,20 @@ let repos_reason loc reason =
   mk_reason (desc_of_reason reason) loc
 
 (* helper: strip root from positions *)
-let strip_root reason path = Loc.(
-  let loc = loc_of_reason reason in
+let strip_root_from_loc root loc = Loc.(
   let source = match loc.source with
   | None -> None
   | Some file -> Some (
-    if Files_js.is_lib_file_or_flowlib_root file
+    if file = Files_js.global_file_name
+    then "[LIB]"
+    else if Files_js.is_lib_file file
     then spf "[LIB] %s" (Filename.basename file)
     else Files_js.relative_path
-      (spf "%s%s" (Path.to_string path) Filename.dir_sep) file
+      (spf "%s%s" (Path.to_string root) Filename.dir_sep) file
   ) in
-  let loc = { loc with source } in
-  repos_reason loc reason
+  { loc with source }
 )
+
+let strip_root root reason =
+  let loc = strip_root_from_loc root (loc_of_reason reason) in
+  repos_reason loc reason

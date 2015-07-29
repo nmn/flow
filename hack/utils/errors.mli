@@ -52,8 +52,9 @@ val object_cast: Pos.t -> string -> unit
 val unset_cast: Pos.t -> unit
 val this_no_argument : Pos.t -> unit
 val this_hint_outside_class : Pos.t -> unit
-val this_must_be_return : Pos.t -> unit
+val this_type_forbidden : Pos.t -> unit
 val lowercase_this : Pos.t -> string -> unit
+val classname_param : Pos.t -> unit
 val tparam_with_tparam : Pos.t -> string -> unit
 val shadowed_type_param : Pos.t -> Pos.t -> string -> unit
 val missing_typehint : Pos.t -> unit
@@ -115,7 +116,8 @@ val array_cast : Pos.t -> unit
 val anonymous_recursive : Pos.t -> unit
 val static_outside_class : Pos.t -> unit
 val self_outside_class : Pos.t -> unit
-val new_static_inconsistent : Pos.t -> (Pos.t * string) -> unit
+val new_inconsistent_construct : Pos.t -> (Pos.t * string)
+  -> [< `static | `classname ] -> unit
 val pair_arity : Pos.t -> unit
 val tuple_arity : Pos.t -> int -> Pos.t -> int -> unit
 val undefined_parent : Pos.t -> unit
@@ -165,7 +167,8 @@ val extend_final : Pos.t -> Pos.t -> string -> unit
 val read_before_write : Pos.t * string -> unit
 val interface_final : Pos.t -> unit
 val trait_final : Pos.t -> unit
-val implement_abstract : Pos.t -> Pos.t -> string -> string -> unit
+val implement_abstract :
+  is_final:bool -> Pos.t -> Pos.t -> string -> string -> unit
 val generic_static : Pos.t -> string -> unit
 val fun_too_many_args : Pos.t -> Pos.t -> unit
 val fun_too_few_args : Pos.t -> Pos.t -> unit
@@ -177,6 +180,7 @@ val type_param_arity : Pos.t -> string -> string -> unit
 val cyclic_typedef : Pos.t -> unit
 val type_arity_mismatch : Pos.t -> string -> Pos.t -> string -> unit
 val this_final : Pos.t * string -> Pos.t -> error -> unit
+val exact_class_final : Pos.t * string -> Pos.t -> error -> unit
 val tuple_arity_mismatch : Pos.t -> string -> Pos.t -> string -> unit
 val fun_arity_mismatch : Pos.t -> Pos.t -> unit
 val discarded_awaitable : Pos.t -> Pos.t -> unit
@@ -228,7 +232,7 @@ val case_fallthrough : Pos.t -> Pos.t -> unit
 val default_fallthrough : Pos.t -> unit
 val visibility_extends : string -> Pos.t -> Pos.t -> string -> unit
 val member_not_implemented : string -> Pos.t -> Pos.t -> Pos.t -> unit
-val override : Pos.t -> string -> Pos.t -> string -> error -> unit
+val bad_decl_override : Pos.t -> string -> Pos.t -> string -> error -> unit
 val missing_constructor : Pos.t -> unit
 val enum_constant_type_bad : Pos.t -> Pos.t -> string -> Pos.t list -> unit
 val enum_type_bad : Pos.t -> string -> Pos.t list -> unit
@@ -273,6 +277,11 @@ val ambiguous_inheritance: Pos.t -> string -> string -> error -> unit
 val cyclic_typeconst : Pos.t -> string list -> unit
 val explain_contravariance : Pos.t -> string -> error -> unit
 val this_lvalue : Pos.t -> unit
+val abstract_concrete_override:
+  Pos.t -> Pos.t -> [< `method_ | `typeconst |`constant]-> unit
+val local_variable_modified_and_used : Pos.t -> Pos.t list -> unit
+val local_variable_modified_twice : Pos.t -> Pos.t list -> unit
+val assign_during_case : Pos.t -> unit
 
 val to_json : Pos.absolute error_ -> Hh_json.json
 val to_string : Pos.absolute error_ -> string
@@ -282,6 +291,7 @@ val try_add_err : Pos.t -> string -> (unit -> 'a) -> (unit -> 'a) -> 'a
 val do_ : (unit -> 'a) -> error list * 'a
 val ignore_ : (unit -> 'a) -> 'a
 val try_when :
-  (unit -> unit) -> when_:(unit -> bool) -> do_:(error -> unit) -> unit
+  (unit -> 'a) -> when_:(unit -> bool) -> do_:(error -> unit) -> 'a
 val has_no_errors : (unit -> 'a) -> bool
+val must_error : (unit -> unit) -> (unit -> unit) -> unit
 val to_absolute : error -> Pos.absolute error_

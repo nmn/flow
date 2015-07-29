@@ -117,30 +117,30 @@ and _ ty_ =
    *)
   | Tvar : Ident.t -> locl ty_
 
-  (* The type of an opaque type alias ("newtype"), outside of the file where it
-   * was defined. They are "opaque", which means that they only unify with
+  (* The type of an opaque type (e.g. a "newtype" outside of the file where it
+   * was defined). They are "opaque", which means that they only unify with
    * themselves. However, it is possible to have a constraint that allows us to
    * relax this. For example:
    *
-   * newtype my_type as int = ...
+   *   newtype my_type as int = ...
    *
    * Outside of the file where the type was defined, this translates to:
    *
-   * Tabstract ((pos, "my_type"), [], Some (Tprim Tint))
+   *   Tabstract (AKnewtype (pos, "my_type", []), Some (Tprim Tint))
    *
    * Which means that my_type is abstract, but is subtype of int as well.
    *
    * We also create abstract types for generic parameters of a function, i.e.
    *
-   *  function foo<T>(T $x): void {
-   *    // Body
-   *  }
+   *   function foo<T>(T $x): void {
+   *     // Body
+   *   }
    *
-   *  The type 'T' will be represented as an abstract type when type checking
-   *  the body of 'foo'.
+   * The type 'T' will be represented as an abstract type when type checking
+   * the body of 'foo'.
    *
-   *  Finally abstract types are also derived from the 'this' type and
-   *  accessing type constants on it, resulting in a dependent type.
+   * Finally abstract types are also derived from the 'this' type and
+   * accessing type constants on it, resulting in a dependent type.
    *)
   | Tabstract : abstract_kind * locl ty option -> locl ty_
 
@@ -215,8 +215,11 @@ and _ ty_ =
  * dependent type
  *)
 and abstract_kind =
+    (* newtype foo<T1, T2> ... *)
   | AKnewtype of string * locl ty list
+    (* <T super C> ; None if 'as' constrained *)
   | AKgeneric of string * locl ty option
+    (* see dependent_type *)
   | AKdependent of dependent_type
 
 (* A dependent type consists of a base kind which indicates what the type is
@@ -415,8 +418,14 @@ module AbstractKind = struct
          | `this -> SN.Typehints.this
          | `static -> "<"^SN.Classes.cStatic^">"
          | `cls c -> c
-         | `expr i -> "<expr#"^string_of_int i^">" in
+         | `expr i ->
+             let display_id = Reason.get_expr_display_id i in
+             "<expr#"^string_of_int display_id^">" in
        String.concat "::" (dt::ids)
+  let is_classname = function
+    | AKnewtype (name, _) -> (name = Naming_special_names.Classes.cClassname)
+    | AKgeneric _ -> false
+    | AKdependent _ -> false
 end
 
 (*****************************************************************************)

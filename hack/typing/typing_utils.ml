@@ -56,6 +56,20 @@ let rec is_option env ty =
       List.exists (is_option env) tyl
   | _ -> false
 
+let is_class ty = match snd ty with
+  | Tclass _ -> true
+  | _ -> false
+
+(*****************************************************************************)
+(* Gets the base type of an abstract type *)
+(*****************************************************************************)
+
+let rec get_base_type ty = match snd ty with
+  | Tabstract (AKnewtype (classname, _), _) when
+      classname = SN.Classes.cClassname -> ty
+  | Tabstract (_, Some ty) -> get_base_type ty
+  | _ -> ty
+
 (*****************************************************************************)
 (* Unification error *)
 (*****************************************************************************)
@@ -65,6 +79,27 @@ let uerror r1 ty1 r2 ty2 =
   Errors.unify_error
     (Reason.to_string ("This is " ^ ty1) r1)
     (Reason.to_string ("It is incompatible with " ^ ty2) r2)
+
+(* We attempt to simplify the unification error to see if it can be
+ * explained without referring to dependent types.
+ *)
+let simplified_uerror env ty1 ty2 =
+  (* Need this check to ensure we don't enter an infiinite loop *)
+  let simplify = match snd ty1, snd ty2 with
+    | Tabstract (AKdependent (`static, []), _), Tclass _
+    | Tclass _, Tabstract (AKdependent (`static, []), _) -> false
+    | Tabstract (AKdependent _, Some _), _
+    | _, Tabstract (AKdependent _, Some _) -> true
+    | _, _ -> false in
+  (* We unify the base types to see if that produces an error, if not then
+   * we use the standard unification error
+   *)
+  if simplify then
+    Errors.must_error
+      (fun _ -> ignore @@ unify env (get_base_type ty1) (get_base_type ty2))
+      (fun _ -> uerror (fst ty1) (snd ty1) (fst ty2) (snd ty2))
+  else
+    uerror (fst ty1) (snd ty1) (fst ty2) (snd ty2)
 
 let process_static_find_ref cid mid =
   match cid with
@@ -159,8 +194,7 @@ let rec member_inter env ty tyl acc =
       Errors.try_
         begin fun () ->
           let env, ty = unify env x ty in
-          let env, res = flatten_unresolved env ty rl in
-          env, List.rev_append acc res
+          env, List.rev_append acc (ty :: rl)
         end
         begin fun _ ->
           member_inter env ty rl (x :: acc)

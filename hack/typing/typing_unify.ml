@@ -90,14 +90,20 @@ and unify_var env (r1, uenv1, n1) (r2, uenv2, n2) =
 
 and unify_ env r1 ty1 r2 ty2 =
   match ty1, ty2 with
+  | Tprim (Nast.Tclassname _), Tprim (Nast.Tclassname _) ->
+    env, ty1
+  | Tprim (Nast.Tclassname _), Tprim (Nast.Tstring)
+  | Tprim (Nast.Tstring), Tprim (Nast.Tclassname _) ->
+    (* Tclassname is created solely within class_class_decl; as such, treating
+     * it as interchangeable with a string for the purposes of unification
+     * should be fairly safe. A typical scenario for the unification is array
+     * literals like "array('foo', 'bar', C1::class, ...)" *)
+    env, Tprim (Nast.Tstring)
   | Tprim x, Tprim y ->
-      (match x, y with
-      | x, y when x = y ->
-          env, Tprim x
-      | _ ->
-          TUtils.uerror r1 ty1 r2 ty2;
-          env, Tany
-      )
+    if x == y then env, Tprim x
+    else
+      let () = TUtils.uerror r1 ty1 r2 ty2 in
+      env, Tany
   | Tarray (None, None), (Tarray _ as ty)
   | (Tarray _ as ty), Tarray (None, None) ->
       env, ty
@@ -170,7 +176,7 @@ and unify_ env r1 ty1 r2 ty2 =
         | None -> env, None
         | Some (env, cstr) -> env, Some cstr in
       env, Tabstract (ak1, tcstr)
-  | Tabstract (AKdependent (_, _),
+  | Tabstract (AKdependent (expr_dep, _),
       Some (_, Tclass ((_, x) as id, _) as ty)), _ ->
       let class_ = Env.get_class env x in
       (* For final class C, there is no difference between abstract<X> and X.
@@ -183,7 +189,7 @@ and unify_ env r1 ty1 r2 ty2 =
           env, snd ty
       | _ ->
           (Errors.try_when
-             (fun () -> TUtils.uerror r1 ty1 r2 ty2)
+             (fun () -> TUtils.simplified_uerror env (r1, ty1) (r2, ty2))
              ~when_: begin fun () ->
                match ty2 with
                | Tclass ((_, y), _) -> y = x
@@ -192,7 +198,12 @@ and unify_ env r1 ty1 r2 ty2 =
                | Tanon (_, _) | Tfun _ | Tunresolved _ | Tobject
                | Tshape _ -> false
              end
-             ~do_:(fun error -> Errors.this_final id (Reason.to_pos r1) error)
+             ~do_: begin fun error ->
+               if expr_dep = `cls x then
+                 Errors.exact_class_final id (Reason.to_pos r2) error
+               else
+                 Errors.this_final id (Reason.to_pos r2) error
+             end
           );
           env, Tany
         )
@@ -217,7 +228,13 @@ and unify_ env r1 ty1 r2 ty2 =
         env, Ttuple tyl
   | Tmixed, Tmixed -> env, Tmixed
   | Tanon (_, id1), Tanon (_, id2) when id1 = id2 -> env, ty1
-  | Tanon _, Tanon _ -> env, Tunresolved [r1, ty1; r2, ty2]
+  | Tanon _, Tanon _ ->
+      (* This could be smarter, but the only place where we currently compare
+       * two anonymous functions is when trying to normalize intersection -
+       * saying that they never unify will just keep the intersection
+       * unchanged, which is always a valid option. *)
+      TUtils.uerror r1 ty1 r2 ty2;
+      env, Tany
   | Tfun ft, Tanon (anon_arity, id)
   | Tanon (anon_arity, id), Tfun ft ->
       (match Env.get_anonymous env id with
@@ -300,7 +317,7 @@ and unify_ env r1 ty1 r2 ty2 =
           | _ -> () in
         add env ty1;
         add env ty2;
-        TUtils.uerror r1 ty1 r2 ty2;
+        TUtils.simplified_uerror env (r1, ty1) (r2, ty2);
         env, Tany
 
 and unify_arities ~ellipsis_is_variadic anon_arity func_arity : bool =

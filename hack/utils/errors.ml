@@ -165,6 +165,8 @@ module Naming                               = struct
   let return_only_typehint                  = 2063 (* DONT MODIFY!!!! *)
   let unexpected_type_arguments             = 2064 (* DONT MODIFY!!!! *)
   let too_many_type_arguments               = 2065 (* DONT MODIFY!!!! *)
+  let classname_param                       = 2066 (* DONT MODIFY!!!! *)
+
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
 
@@ -342,6 +344,10 @@ module Typing                               = struct
   let invalid_shape_remove_key              = 4139 (* DONT MODIFY!!!! *)
   let missing_optional_field                = 4140 (* DONT MODIFY!!!! *)
   let shape_field_unset                     = 4141 (* DONT MODIFY!!!! *)
+  let abstract_concrete_override            = 4142 (* DONT MODIFY!!!! *)
+  let local_variable_modifed_and_used       = 4143 (* DONT MODIFY!!!! *)
+  let local_variable_modifed_twice          = 4144 (* DONT MODIFY!!!! *)
+  let assign_during_case                    = 4145 (* DONT MODIFY!!!! *)
   (* EXTEND HERE WITH NEW VALUES IF NEEDED *)
 end
 
@@ -519,16 +525,20 @@ let this_hint_outside_class pos =
    add Naming.this_hint_outside_class pos
     "Cannot use \"this\" outside of a class"
 
-let this_must_be_return pos =
-  add Naming.this_must_be_return pos
-    "The type \"this\" can only be used as a return type, \
-     to instantiate a covariant type variable, \
-     or as a private non-static member variable"
+let this_type_forbidden pos =
+ add Naming.this_must_be_return pos
+    "The type \"this\" cannot be used as a constraint on a class' generic, \
+     or as the type of a static member variable"
 
 let lowercase_this pos type_ =
   add Naming.lowercase_this pos (
   "Invalid Hack type \""^type_^"\". Use \"this\" instead"
  )
+
+let classname_param pos =
+  add Naming.classname_param pos
+    ("Missing type parameter to classname; classname is entirely"
+     ^" meaningless without one")
 
 let tparam_with_tparam pos x =
   add Naming.tparam_with_tparam pos (
@@ -874,7 +884,7 @@ let member_not_implemented member_name parent_pos pos defn_pos =
   let msg3 = defn_pos, "As defined here" in
   add_list Typing.member_not_implemented [msg1; msg2; msg3]
 
-let override parent_pos parent_name pos name (error: error) =
+let bad_decl_override parent_pos parent_name pos name (error: error) =
   let msg1 = pos, ("This object is of type "^(strip_ns name)) in
   let msg2 = parent_pos,
     ("It is incompatible with this object of type "^(strip_ns parent_name)^
@@ -1184,11 +1194,14 @@ let self_outside_class pos =
   add Typing.self_outside_class pos
     "'self' is undefined outside of a class"
 
-let new_static_inconsistent new_pos (cpos, cname) =
+let new_inconsistent_construct new_pos (cpos, cname) kind =
   let name = Utils.strip_ns cname in
+  let preamble = match kind with
+    | `static -> "Can't use new static() for "^name
+    | `classname -> "Can't use new on classname<"^name^">"
+  in
   add_list Typing.new_static_inconsistent [
-    new_pos, "Can't use new static() for "^name^
-  "; __construct arguments are not \
+    new_pos, preamble^"; __construct arguments are not \
     guaranteed to be consistent in child classes";
     cpos, ("This declaration neither defines an abstract/final __construct"
            ^" nor uses <<__ConsistentConstruct>> attribute")]
@@ -1387,10 +1400,17 @@ let trait_final pos =
   add Typing.trait_final pos
     "Traits cannot be final"
 
-let implement_abstract pos1 pos2 kind x =
+let implement_abstract ~is_final pos1 pos2 kind x =
   let name = "abstract "^kind^" '"^x^"'" in
+  let msg1 =
+    if is_final then
+      "This class was declared as final. It must provide an implementation \
+       for the "^name
+    else
+      "This class must be declared abstract, or provide an implementation \
+       for the "^name in
   add_list Typing.implement_abstract [
-    pos1, "This class must be declared abstract, or provide an implementation for the "^name;
+    pos1, msg1;
     pos2, "Declaration is here";
   ]
 
@@ -1458,6 +1478,14 @@ let this_final id pos2 (error: error) =
   let n = Utils.strip_ns (snd id) in
   let message1 = "Since "^n^" is not final" in
   let message2 = "this might not be a "^n in
+  let code, msgl = error in
+  add_list code (msgl @ [(fst id, message1); (pos2, message2)])
+
+let exact_class_final id pos2 (error: error) =
+  let n = Utils.strip_ns (snd id) in
+  let message1 = "This requires the late-bound type to be exactly "^n in
+  let message2 =
+    "Since " ^n^" is not final this might be an instance of a child class" in
   let code, msgl = error in
   add_list code (msgl @ [(fst id, message1); (pos2, message2)])
 
@@ -1549,6 +1577,16 @@ let cyclic_typeconst pos sl =
 
 let this_lvalue pos =
   add Typing.this_lvalue pos "Cannot assign a value to $this"
+
+let abstract_concrete_override pos parent_pos kind =
+  let kind_str = match kind with
+    | `method_ -> "method"
+    | `typeconst -> "type constant"
+    | `constant -> "constant" in
+  add_list Typing.abstract_concrete_override ([
+    pos, "Cannot re-declare this " ^ kind_str ^ " as abstract";
+    parent_pos, "Previously defined here"
+  ])
 
 (*****************************************************************************)
 (* Typing decl errors *)
@@ -1666,6 +1704,23 @@ let explain_contravariance pos c_name error =
   let code, msgl = error in
   add_list code (msgl @ [pos, message])
 
+let local_variable_modified_and_used pos_modified pos_used_l =
+  let used_msg p = p, "And accessed here" in
+  add_list Typing.local_variable_modifed_and_used
+           ((pos_modified, "Unsequenced modification and access to local \
+                            variable. Modified here") ::
+            List.map used_msg pos_used_l)
+let local_variable_modified_twice pos_modified pos_modified_l =
+  let modified_msg p = p, "And also modified here" in
+  add_list Typing.local_variable_modifed_twice
+           ((pos_modified, "Unsequenced modifications to local variable. \
+                            Modified here") ::
+            List.map modified_msg pos_modified_l)
+let assign_during_case p =
+  add Typing.assign_during_case p
+    "Don't assign to variables inside of case labels"
+
+
 (*****************************************************************************)
 (* Convert relative paths to absolute. *)
 (*****************************************************************************)
@@ -1714,7 +1769,7 @@ let to_string ((error_code, msgl) : Pos.absolute error_) : string =
 (* Try if errors. *)
 (*****************************************************************************)
 
-let try_ f1 f2 =
+let try_with_result f1 f2 =
   let error_list_copy = !error_list in
   let accumulate_errors_copy = !accumulate_errors in
   error_list := [];
@@ -1725,7 +1780,10 @@ let try_ f1 f2 =
   accumulate_errors := accumulate_errors_copy;
   match List.rev errors with
   | [] -> result
-  | l :: _ -> f2 l
+  | l :: _ -> f2 result l
+
+let try_ f1 f2 =
+  try_with_result f1 (fun _ l -> f2 l)
 
 let try_with_error f1 f2 =
   try_ f1 (fun err -> add_error err; f2())
@@ -1758,8 +1816,16 @@ let ignore_ f =
   snd (do_ f)
 
 let try_when f ~when_ ~do_ =
-  try_ f begin fun (error: error) ->
+  try_with_result f begin fun result (error: error) ->
     if when_()
     then do_ error
-    else add_error error
+    else add_error error;
+    result
   end
+
+(* Runs the first function that is expected to produce an error. If it doesn't
+ * then we run the second function we are given
+ *)
+let must_error f error_fun =
+  let had_no_errors = try_with_error (fun () -> f(); true) (fun _ -> false) in
+  if had_no_errors then error_fun();

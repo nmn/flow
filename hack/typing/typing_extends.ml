@@ -21,6 +21,7 @@ module Env = Typing_env
 module TUtils = Typing_utils
 module Inst = Typing_instantiate
 module Phase = Typing_phase
+module SN = Naming_special_names
 
 (*****************************************************************************)
 (* Helpers *)
@@ -96,9 +97,15 @@ let check_types_for_const env parent_type class_type =
     | Tgeneric (_, Some (Ast.Constraint_as, fty_parent)), _ ->
       (* const definition constrained by parent abstract const *)
       ignore (Phase.sub_type_decl env fty_parent class_type)
+    | _, Tgeneric(_, _) ->
+      (* Trying to override concrete type with an abstract one *)
+      let pos = Reason.to_pos (fst class_type) in
+      let parent_pos = Reason.to_pos (fst parent_type) in
+      Errors.abstract_concrete_override pos parent_pos `constant;
     | (_, _) ->
       (* types should be the same *)
       ignore (Phase.unify_decl env parent_type class_type)
+
 (* An abstract member can be declared in multiple ancestors. Sometimes these
  * declarations can be different, but yet compatible depending on which ancestor
  * we inherit the member from. For example:
@@ -166,7 +173,7 @@ let check_members check_private env parent_class class_ parent_members members =
     | Some class_elt  ->
       check_override env parent_class class_ parent_class_elt class_elt
     | None -> ()
- end parent_members
+  end parent_members
 
 (*****************************************************************************)
 (* Before checking that a class implements an interface, we have to
@@ -239,19 +246,26 @@ let check_constructors env parent_class class_ psubst subst =
  * the parent's type constant.
  *)
 let tconst_subsumption env parent_typeconst child_typeconst =
-  let pos = fst child_typeconst.ttc_name in
+  let pos, name = child_typeconst.ttc_name in
   let parent_pos = fst parent_typeconst.ttc_name in
+  let parent_is_concrete = Option.is_some parent_typeconst.ttc_type in
   let is_final =
     Option.is_none parent_typeconst.ttc_constraint &&
-    Option.is_some parent_typeconst.ttc_type in
+    parent_is_concrete in
 
   (* Check that the child's constraint is compatible with the parent. If the
    * parent has a constraint then the child must also have a constraint if it
    * is abstract
    *)
   let child_is_abstract = Option.is_none child_typeconst.ttc_type in
+  if parent_is_concrete && child_is_abstract then
+    (* It is valid for abstract class to extend a concrete class, but it cannot
+     * redefine already concrete members as abstract.
+     * See typecheck/tconst/subsume_tconst5.php test case for example. *)
+    Errors.abstract_concrete_override pos parent_pos `typeconst;
+
   let default = Reason.Rtconst_no_cstr child_typeconst.ttc_name,
-                Tgeneric (snd child_typeconst.ttc_name, None) in
+                Tgeneric (name, None) in
   let child_cstr =
     if child_is_abstract
     then Some (Option.value child_typeconst.ttc_constraint ~default)
@@ -281,7 +295,7 @@ let tconst_subsumption env parent_typeconst child_typeconst =
 (* For type constants we need to check that a child respects the
  * constraints specified by its parent.  *)
 let check_typeconsts env parent_class class_ =
-    let parent_pos, parent_class, _ = parent_class in
+  let parent_pos, parent_class, _ = parent_class in
   let pos, class_, _ = class_ in
   let ptypeconsts = parent_class.tc_typeconsts in
   let typeconsts = class_.tc_typeconsts in
@@ -303,12 +317,13 @@ let check_consts env parent_class class_ psubst subst =
   let env, consts = instantiate_members subst env consts in
   let check_const_override = check_override env ~check_for_const:true parent_class class_ in
   SMap.iter begin fun const_name parent_const ->
-    match SMap.get const_name consts with
-      | Some const -> check_const_override parent_const const
-      | None ->
-        let parent_pos = Reason.to_pos (fst parent_const.ce_type) in
-        Errors.member_not_implemented const_name parent_pos
-          class_.tc_pos parent_class.tc_pos
+    if const_name <> SN.Members.mClass then
+      match SMap.get const_name consts with
+        | Some const -> check_const_override parent_const const
+        | None ->
+          let parent_pos = Reason.to_pos (fst parent_const.ce_type) in
+          Errors.member_not_implemented const_name parent_pos
+            class_.tc_pos parent_class.tc_pos;
   end pconsts;
   ()
 
@@ -352,4 +367,4 @@ let check_implements env parent_type type_ =
         (fun errorl ->
           let p_name_pos, p_name_str = parent_name in
           let name_pos, name_str = name in
-          Errors.override p_name_pos p_name_str name_pos name_str errorl)
+          Errors.bad_decl_override p_name_pos p_name_str name_pos name_str errorl)

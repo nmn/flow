@@ -123,8 +123,10 @@ let summarize cx t = match t with
      optimization in that they avoid creation of fresh type
      variables. Semantically, we could have the above case fire unconditionally,
      since the fresh type variable is unified in all cases. *)
-  | StrT (reason, Some _) -> StrT.why reason
-  | NumT (reason, Some _) -> NumT.why reason
+  | StrT (reason, AnyLiteral) -> t
+  | StrT (reason, _) -> StrT.why reason
+  | NumT (reason, AnyLiteral) -> t
+  | NumT (reason, _) -> NumT.why reason
   | _ -> t
 
 let mk_module_t cx reason = ModuleT(
@@ -312,7 +314,7 @@ let rec destructuring cx t f = Ast.Pattern.(function
         | Some (Element ((loc, _) as p)) ->
             let i = NumT (
               mk_reason "number" loc,
-              Some (float i, string_of_int i)
+              Literal (float i, string_of_int i)
             ) in
             let tvar = Flow_js.mk_tvar cx reason in
             Flow_js.flow cx (t, GetElemT(reason,i,tvar));
@@ -559,6 +561,11 @@ let check_type_param_arity cx loc params n f =
 let is_suppress_type type_name = FlowConfig.(
   let config = get_unsafe () in
   SSet.mem type_name config.options.suppress_types
+)
+
+let are_getters_and_setters_enabled () = FlowConfig.(
+  let config = get_unsafe () in
+  config.options.enable_unsafe_getters_and_setters
 )
 
 (**********************************)
@@ -2607,7 +2614,69 @@ and object_ cx props = Ast.Expression.Object.(
       Flow_js.add_error cx [mk_reason "" loc, msg];
       map
 
-    (* get/set kind *)
+
+    (* With the enable_unsafe_getters_and_setters option set, we enable some
+     * unsafe support for getters and setters. The main unsafe bit is that we
+     * don't properly havok refinements when getter and setter methods are called.
+     * When used in objects, they're a little strange. Technically the getter's
+     * return type and the setter's param type don't have to be the same.
+     *
+     * To properly model this, we should keep track of which properties have
+     * getters and setters. However, for now we'll be a little overly strict
+     * and just enforce that any property that has had a getter and a setter
+     * should just let the setter's param type flow to the getter's return type.
+     *)
+
+    (* unsafe getter property *)
+    | Property (loc, {
+        Property.kind = Property.Get;
+        key = Property.Identifier (_, { Ast.Identifier.name; typeAnnotation; _ });
+        value = (vloc, Ast.Expression.Function func);
+        _ })
+      when are_getters_and_setters_enabled () ->
+      Ast.Expression.Function.(
+        let { body; returnType; _ } = func in
+        let reason = mk_reason "getter function" vloc in
+        let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
+        let function_type = mk_function None cx ~async:false reason None
+          ([], [], None) returnType body this
+        in
+        let return_t = extract_getter_type function_type in
+        let map, prop_t = (match SMap.get name map with
+        | Some prop_t -> map, prop_t
+        | _ ->
+          let prop_t =
+            Flow_js.mk_tvar cx (mk_reason "getter/setter property" vloc) in
+          SMap.add name prop_t map, prop_t) in
+        Flow_js.unify cx prop_t return_t;
+        map
+      )
+
+    (* unsafe setter property *)
+    | Property (loc, {
+      Property.kind = Property.Set;
+        key = Property.Identifier (_, { Ast.Identifier.name; typeAnnotation; _ });
+        value = (vloc, Ast.Expression.Function func);
+        _ })
+      when are_getters_and_setters_enabled () ->
+      Ast.Expression.Function.(
+        let { params; defaults; body; returnType; _ } = func in
+        let reason = mk_reason "setter function" vloc in
+        let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
+        let function_type = mk_function None cx ~async:false reason None
+          (params, defaults, None) returnType body this
+        in
+        let param_t = extract_setter_type function_type in
+        let map, prop_t = (match SMap.get name map with
+        | Some prop_t -> map, prop_t
+        | _ ->
+          let prop_t =
+            Flow_js.mk_tvar cx (mk_reason "getter/setter property" vloc) in
+          SMap.add name prop_t map, prop_t) in
+        Flow_js.unify cx prop_t param_t;
+        map
+      )
+
     | Property (loc, { Property.kind = Property.Get | Property.Set; _ }) ->
       let msg = "get/set properties not yet supported" in
       Flow_js.add_error cx [mk_reason "" loc, msg];
@@ -3012,7 +3081,7 @@ and expression_ ~is_cond cx loc e = Ast.Expression.(match e with
       | [argt] ->
         let reason = mk_reason "new Array(..)" loc in
         Flow_js.flow cx
-          (argt, NumT (replace_reason "array length" reason, None));
+          (argt, NumT (replace_reason "array length" reason, AnyLiteral));
         let element_reason = replace_reason "array element" reason in
         let t = Flow_js.mk_tvar cx element_reason in
         ArrT (reason, t, [])
@@ -3370,8 +3439,8 @@ and literal cx loc lit = Ast.Literal.(match lit.value with
   | String s ->
     let lit =
       if reflective s || non_identifier s
-      then None
-      else Some s
+      then AnyLiteral
+      else Literal s
     in
       StrT (mk_reason "string" loc, lit)
 
@@ -3385,7 +3454,7 @@ and literal cx loc lit = Ast.Literal.(match lit.value with
       UnionT (reason, [null; Flow_js.mk_tvar cx reason])
 
   | Number f ->
-      NumT (mk_reason "number" loc, Some (f, lit.raw))
+      NumT (mk_reason "number" loc, Literal (f, lit.raw))
 
   | RegExp rx ->
       Flow_js.get_builtin_type cx (mk_reason "regexp" loc) "RegExp"
@@ -4029,19 +4098,20 @@ and mk_proptypes cx props = Ast.Expression.Object.(
 
     (* literal LHS *)
     | Property (loc, { Property.key = Property.Literal _; _ }) ->
-      let msg = "non-string literal property keys not supported" in
+      let msg =
+        "non-string literal property keys not supported for React propTypes" in
       Flow_js.add_error cx [mk_reason "" loc, msg];
       amap, omap, dict
 
     (* get/set kind *)
     | Property (loc, { Property.kind = Property.Get | Property.Set; _ }) ->
-      let msg = "get/set properties not yet supported" in
+      let msg = "get/set properties not supported for React propTypes" in
       Flow_js.add_error cx [mk_reason "" loc, msg];
       amap, omap, dict
 
     (* computed LHS *)
     | Property (loc, { Property.key = Property.Computed _; _ }) ->
-      let msg = "computed property keys not supported" in
+      let msg = "computed property keys not supported for React propTypes" in
       Flow_js.add_error cx [mk_reason "" loc, msg];
       amap, omap, dict
 
@@ -4723,11 +4793,10 @@ and mk_extends cx map = function
       root
   | (None, _) ->
       assert false (* type args with no head expr *)
-  | (Some e, targs) ->
+  | (Some c, targs) ->
       let params = match targs with
       | None -> None
       | Some (_, { Ast.Type.ParameterInstantiation.params; }) -> Some params in
-      let c = expression cx e in
       mk_nominal_type ~for_type:false cx (reason_of_t c) map (c, params)
 
 (* Given the type of expression C and type arguments T1...Tn, return the type of
@@ -4772,7 +4841,16 @@ and mk_signature cx reason_c c_type_params_map superClass body = Ast.Class.(
      to be redeclared if they were assigned in the constructor. So we don't do
      it. In the future, we could do it again, but only for private fields. *)
 
-  List.fold_left (fun (sfields, smethods, fields, methods) -> function
+  List.fold_left (fun (
+    sfields,
+    smethods,
+    sgetters,
+    ssetters,
+    fields,
+    methods,
+    getters,
+    setters
+  ) -> function
 
     (* instance and static methods *)
     | Body.Method (loc, {
@@ -4780,9 +4858,15 @@ and mk_signature cx reason_c c_type_params_map superClass body = Ast.Class.(
           { Ast.Identifier.name; _ });
         value = _, { Ast.Expression.Function.params; defaults; rest;
           returnType; typeParameters; body; _ };
-        kind = Ast.Expression.Object.Property.Init;
+        kind;
         static;
       }) ->
+
+      (match kind with
+      | Method.Get | Method.Set when not (are_getters_and_setters_enabled ()) ->
+        let msg = "get/set properties not yet supported" in
+        Flow_js.add_error cx [mk_reason "" loc, msg]
+      | _ -> ());
 
       let typeparams, f_type_params_map =
         mk_type_param_declarations cx ~map:c_type_params_map typeParameters in
@@ -4791,54 +4875,108 @@ and mk_signature cx reason_c c_type_params_map superClass body = Ast.Class.(
 
       let params_ret = mk_params_ret cx map
         (params, defaults, rest) (body_loc body, returnType) in
-      let reason_m = mk_reason (spf "method %s" name) loc in
+      let reason_desc = (match kind with
+      | Method.Method -> spf "method %s" name
+      | Method.Constructor -> "constructor"
+      | Method.Get -> spf "getter for %s" name
+      | Method.Set -> spf "setter for %s" name) in
+      let reason_m = mk_reason reason_desc loc in
       let method_sig = reason_m, typeparams, f_type_params_map, params_ret in
-      if static
-      then
+
+      (match kind, static with
+      | (Method.Constructor | Method.Method), true ->
         sfields,
         SMap.add name method_sig smethods,
+        SMap.remove name sgetters,
+        SMap.remove name ssetters,
         fields,
-        methods
-      else
+        methods,
+        getters,
+        setters
+      | Method.Get, true ->
+        sfields,
+        SMap.remove name smethods,
+        SMap.add name method_sig sgetters,
+        ssetters,
+        fields,
+        methods,
+        getters,
+        setters
+      | Method.Set, true ->
+        sfields,
+        SMap.remove name smethods,
+        sgetters,
+        SMap.add name method_sig ssetters,
+        fields,
+        methods,
+        getters,
+        setters
+      | (Method.Constructor | Method.Method), false ->
         sfields,
         smethods,
+        sgetters,
+        ssetters,
         fields,
-        SMap.add name method_sig methods
+        SMap.add name method_sig methods,
+        SMap.remove name getters,
+        SMap.remove name setters
+      | Method.Get, false ->
+        sfields,
+        smethods,
+        sgetters,
+        ssetters,
+        fields,
+        SMap.remove name methods,
+        SMap.add name method_sig getters,
+        setters
+      | Method.Set, false ->
+        sfields,
+        smethods,
+        sgetters,
+        ssetters,
+        fields,
+        SMap.remove name methods,
+        getters,
+        SMap.add name method_sig setters)
 
     (* fields *)
     | Body.Property (loc, {
         Property.key = Ast.Expression.Object.Property.Identifier
           (_, { Ast.Identifier.name; _ });
-        typeAnnotation = (_, typeAnnotation);
+        typeAnnotation;
+        value;
         static;
       }) ->
-        let t = convert cx c_type_params_map typeAnnotation in
+        if value <> None
+        then begin
+          let msg = "class property initializers are not yet supported" in
+          Flow_js.add_error cx [mk_reason "" loc, msg]
+        end;
+        let r = mk_reason (spf "class property %s" name) loc in
+        let t = mk_type_annotation_ cx c_type_params_map r typeAnnotation in
         if static
         then
           SMap.add name t sfields,
           smethods,
+          SMap.remove name sgetters,
+          SMap.remove name ssetters,
           fields,
-          methods
+          methods,
+          getters,
+          setters
         else
           sfields,
           smethods,
+          getters,
+          setters,
           SMap.add name t fields,
-          methods
-
-    (* get/set *)
-    | Body.Method (loc, {
-        Method.kind = Ast.Expression.Object.Property.Get
-                    | Ast.Expression.Object.Property.Set;
-        _
-      }) ->
-        let msg = "get/set properties not yet supported" in
-        Flow_js.add_error cx [mk_reason "" loc, msg];
-        sfields, smethods, fields, methods
+          methods,
+          SMap.remove name getters,
+          SMap.remove name setters
 
     (* literal LHS *)
     | Body.Method (loc, {
         Method.key = Ast.Expression.Object.Property.Literal _;
-        Method.kind = Ast.Expression.Object.Property.Init;
         _
       })
     | Body.Property (loc, {
@@ -4847,12 +4985,11 @@ and mk_signature cx reason_c c_type_params_map superClass body = Ast.Class.(
       }) ->
         let msg = "literal properties not yet supported" in
         Flow_js.add_error cx [mk_reason "" loc, msg];
-        sfields, smethods, fields, methods
+        sfields, smethods, sgetters, ssetters, fields, methods, getters, setters
 
     (* computed LHS *)
     | Body.Method (loc, {
         Method.key = Ast.Expression.Object.Property.Computed _;
-        Method.kind = Ast.Expression.Object.Property.Init;
         _
       })
     | Body.Property (loc, {
@@ -4861,8 +4998,17 @@ and mk_signature cx reason_c c_type_params_map superClass body = Ast.Class.(
       }) ->
         let msg = "computed property keys not supported" in
         Flow_js.add_error cx [mk_reason "" loc, msg];
-        sfields, smethods, fields, methods
-  ) (SMap.empty, SMap.empty, SMap.empty, default_methods) elements
+        sfields, smethods, sgetters, ssetters, fields, methods, getters, setters
+  ) (
+    SMap.empty,      (* sfields *)
+    SMap.empty,      (* smethods *)
+    SMap.empty,      (* sgetters *)
+    SMap.empty,      (* ssetters *)
+    SMap.empty,      (* fields *)
+    default_methods, (* methods *)
+    SMap.empty,      (* getters *)
+    SMap.empty       (* setters *)
+  ) elements
 )
 
 (* Processes the bodies of instance and static methods. *)
@@ -4875,16 +5021,22 @@ and mk_class_elements cx instance_info static_info body = Ast.Class.(
           { Ast.Identifier.name; _ });
         value = _, { Ast.Expression.Function.params; defaults; rest;
           returnType; typeParameters; body; async; _ };
-        kind = Ast.Expression.Object.Property.Init;
         static;
+        kind;
       }) ->
-      let this, super, method_sigs =
+      let this, super, method_sigs, getter_sigs, setter_sigs =
         if static then static_info else instance_info
       in
 
+      let sigs_to_use = match kind with
+      | Method.Constructor
+      | Method.Method -> method_sigs
+      | Method.Get -> getter_sigs
+      | Method.Set -> setter_sigs in
+
       let reason, typeparams, type_params_map,
            (_, _, ret, param_types_map, param_loc_map) =
-        SMap.find_unsafe name method_sigs in
+        SMap.find_unsafe name sigs_to_use in
 
       let save_return_exn = Abnormal.swap Abnormal.Return false in
       let save_throw_exn = Abnormal.swap Abnormal.Throw false in
@@ -4912,6 +5064,14 @@ and mk_methodtype (reason_m, typeparams,_,(params,params_names,ret,_,_)) =
   then ft
   else PolyT (typeparams, ft)
 
+and extract_setter_type = function
+  | FunT (_, _, _, { params_tlist = [param_t]; _; }) -> param_t
+  | _ ->  failwith "Setter property with unexpected type"
+
+and extract_getter_type = function
+  | FunT (_, _, _, { return_t; _; }) -> return_t
+  | _ -> failwith "Getter property with unexpected type"
+
 and extract_class_name class_loc  = Ast.Class.(function {id; _;} ->
   match id with
   | Some(name_loc, {Ast.Identifier.name; _;}) -> (name_loc, name)
@@ -4924,8 +5084,28 @@ and extract_class_name class_loc  = Ast.Class.(function {id; _;} ->
    static members. The static members can be thought of as instance members of a
    "metaclass": thus, the static type is itself implemented as an instance
    type. *)
-and mk_class cx loc reason_c = Ast.Class.(function { id=_; body; superClass;
-  typeParameters; superTypeParameters; implements } ->
+and mk_class = Ast.Class.(
+  let merge_getters_and_setters cx getters setters =
+    SMap.fold
+      (fun name setter_type getters_and_setters ->
+        match SMap.get name getters_and_setters with
+        | Some prop_t ->
+          Flow_js.unify cx setter_type prop_t;
+          getters_and_setters
+        | None ->
+          SMap.add name setter_type getters_and_setters
+      )
+      (SMap.map extract_setter_type setters)
+      (SMap.map extract_getter_type getters)
+
+  in fun cx loc reason_c {
+    id=_;
+    body;
+    superClass;
+    typeParameters;
+    superTypeParameters;
+    implements;
+  } ->
 
   (* As a running example, let's say the class declaration is:
      class C<X> extends D<X> { f: X; m<Y: X>(x: Y): X { ... } }
@@ -4946,14 +5126,22 @@ and mk_class cx loc reason_c = Ast.Class.(function { id=_; body; superClass;
   ) SMap.empty typeparams in
 
   (* fields: { f: X }, methods_: { m<Y: X>(x: Y): X } *)
-  let sfields, smethods_, fields, methods_ =
+  let
+    sfields,
+    smethods_,
+    sgetters_,
+    ssetters_,
+    fields,
+    methods_,
+    getters_,
+    setters_ =
     mk_signature cx reason_c type_params_map superClass body
   in
 
   let id = Flow_js.mk_nominal cx in
 
   (* super: D<X> *)
-  let extends = superClass, superTypeParameters in
+  let extends = opt_map (expression cx) superClass, superTypeParameters in
   let super = mk_extends cx type_params_map extends in
   let super_static = ClassT (super) in
 
@@ -4996,6 +5184,23 @@ and mk_class cx loc reason_c = Ast.Class.(function { id=_; body; superClass;
     let methods = methods_ |> SMap.map mk_methodtype in
     let smethods_ = smethods_ |> SMap.map (subst_method_sig cx map_) in
     let smethods = smethods_ |> SMap.map mk_methodtype in
+    let getters_ = getters_ |> SMap.map (subst_method_sig cx map_) in
+    let getters = getters_ |> SMap.map mk_methodtype in
+    let sgetters_ = sgetters_ |> SMap.map (subst_method_sig cx map_) in
+    let sgetters = sgetters_ |> SMap.map mk_methodtype in
+    let setters_ = setters_ |> SMap.map (subst_method_sig cx map_) in
+    let setters = setters_ |> SMap.map mk_methodtype in
+    let ssetters_ = ssetters_ |> SMap.map (subst_method_sig cx map_) in
+    let ssetters = ssetters_ |> SMap.map mk_methodtype in
+
+    (* If there is a both a getter and a setter, then flow the setter type to
+     * the getter. Otherwise just use the getter type or the setter type *)
+    let sgetters_and_setters = merge_getters_and_setters cx sgetters ssetters in
+    let getters_and_setters = merge_getters_and_setters cx getters setters in
+
+    (* Treat getters and setters as fields *)
+    let sfields = SMap.fold SMap.add sgetters_and_setters sfields in
+    let fields = SMap.fold SMap.add getters_and_setters fields in
 
     let static_instance = {
       class_id = 0;
@@ -5027,8 +5232,8 @@ and mk_class cx loc reason_c = Ast.Class.(function { id=_; body; superClass;
     let this = InstanceT (reason_c,static,super,instance) in
 
     mk_class_elements cx
-      (this, super, methods_)
-      (static, super_static, smethods_)
+      (this, super, methods_, getters_, setters_)
+      (static, super_static, smethods_, sgetters_, ssetters_)
       body;
   );
 
@@ -5047,6 +5252,19 @@ and mk_class cx loc reason_c = Ast.Class.(function { id=_; body; superClass;
 
   let methods = methods_ |> SMap.map enforce_void_return in
   let smethods = smethods_ |> SMap.map enforce_void_return in
+  let getters = getters_ |> SMap.map enforce_void_return in
+  let sgetters = sgetters_ |> SMap.map enforce_void_return in
+  let setters = setters_ |> SMap.map enforce_void_return in
+  let ssetters = ssetters_ |> SMap.map enforce_void_return in
+
+  (* If there is a both a getter and a setter, then flow the setter type to
+    * the getter. Otherwise just use the getter type or the setter type *)
+  let sgetters_and_setters = merge_getters_and_setters cx sgetters ssetters in
+  let getters_and_setters = merge_getters_and_setters cx getters setters in
+
+  (* Treat getters and setters as fields *)
+  let sfields = SMap.fold SMap.add sgetters_and_setters sfields in
+  let fields = SMap.fold SMap.add getters_and_setters fields in
 
   let static_instance = {
     class_id = 0;
@@ -5097,9 +5315,11 @@ and mk_interface cx reason_i typeparams map (sfmap, smmap, fmap, mmap) extends s
   let extends =
     match extends with
     | [] -> (None,None)
-    | (loc,{Ast.Statement.Interface.Extends.id; typeParameters})::_ ->
+    | (loc, {Ast.Type.Generic.id = qualification; typeParameters})::_ ->
         (* TODO: multiple extends *)
-        Some (loc,Ast.Expression.Identifier id), typeParameters
+        let c = convert_qualification ~for_type:false cx
+          "extends" qualification in
+        Some c, typeParameters
   in
   let super = mk_extends cx map extends in
   let super_static = ClassT(super) in

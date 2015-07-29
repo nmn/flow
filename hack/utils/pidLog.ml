@@ -10,14 +10,14 @@
 
 let log_oc = ref None
 
-let init root =
+let init pids_file =
   assert (!log_oc = None);
   Sys_utils.with_umask 0o111 begin fun () ->
-    log_oc := Some (open_out (Lock.lock_name root "pids"))
+    log_oc := Some (open_out pids_file)
   end
 
 let log ?reason pid =
-  let reason = match reason with 
+  let reason = match reason with
     | None -> "unknown"
     | Some s -> s in
   match !log_oc with
@@ -26,11 +26,11 @@ let log ?reason pid =
 
 exception FailedToGetPids
 
-let get_pids root =
-  try 
-    let ic = open_in (Lock.lock_name root "pids") in
+let get_pids pids_file =
+  try
+    let ic = open_in pids_file in
     let results = ref [] in
-    begin try 
+    begin try
       while true do
         let row = input_line ic in
         if Str.string_match (Str.regexp "^\\([0-9]+\\)\t\\(.+\\)") row 0
@@ -42,5 +42,5 @@ let get_pids root =
     with End_of_file -> () end;
     close_in ic;
     List.rev !results
-  with Sys_error _ -> 
+  with Sys_error _ ->
     raise FailedToGetPids

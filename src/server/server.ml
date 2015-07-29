@@ -22,8 +22,6 @@ struct
   open ServerEnv
   open ServerUtils
 
-  module EventLogger = FlowEventLogger
-
   let name = "flow server"
 
   let config_path root = Path.concat root ".flowconfig"
@@ -41,9 +39,6 @@ struct
      * example *)
     let flow_options = OptionParser.parse () in
     Types_js.init_modes flow_options;
-    (* Force flowlib files to be extracted and their location saved before workers
-     * fork, so everyone can know about the same flowlib path. *)
-    ignore (Flowlib.get_flowlib_root ());
     ignore (Flow_js.master_cx ());
     ignore (Flow_js.builtins ());
     Parsing_service_js.call_on_success SearchService_js.update
@@ -51,7 +46,7 @@ struct
   let init genv env =
     if not (Options.is_check_mode genv.ServerEnv.options) then (
       (* write binary path and version to server log *)
-      Hh_logger.log "executable=%s" Sys.executable_name;
+      Hh_logger.log "executable=%s" (Sys_utils.executable_path ());
       Hh_logger.log "version=%s" FlowConfig.version);
     (* start the server *)
     let env = Types_js.server_init genv env in
@@ -69,7 +64,7 @@ struct
 
   let incorrect_hash oc =
     ServerProt.response_to_channel oc ServerProt.SERVER_OUT_OF_DATE;
-    EventLogger.out_of_date ();
+    FlowEventLogger.out_of_date ();
     Printf.printf     "Status: Error\n";
     Printf.printf     "%s is out of date. Exiting.\n" name;
     exit 4
@@ -110,12 +105,12 @@ struct
     (* TODO: check status.directory *)
     status_log env;
     let errors = Types_js.get_errors () in
-    EventLogger.check_response errors;
+    FlowEventLogger.status_response errors;
     send_errorl errors oc
 
   let die_nicely genv oc =
     ServerProt.response_to_channel oc ServerProt.SERVER_DYING;
-    EventLogger.killed ();
+    FlowEventLogger.killed ();
     Printf.printf "Status: Error\n";
     Printf.printf "Sent KILL command by client. Dying.\n";
     (match genv.ServerEnv.dfind with

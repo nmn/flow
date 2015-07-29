@@ -50,17 +50,21 @@ let empty_env env ety_env ids = {
 }
 
 let rec expand_with_env ety_env env reason root ids =
-  let expand_env = empty_env env ety_env ids in
-  let env, ty = expand_ expand_env root in
-  let reason = Reason.Rtype_access(
-    reason,
-    env.trail
-    |> List.rev
-    |> List.map (compose strip_ns ExprDepTy.to_string ),
-    fst ty
-  ) in
-  let ty = reason, snd ty in
-  expand_env.tenv, (expand_env.ety_env, ty)
+  let env = empty_env env ety_env ids in
+  let env, (root_r, root_ty) = expand_ env root in
+  let trail = env.trail
+              |> List.rev
+              |> List.map (compose strip_ns ExprDepTy.to_string) in
+  let reason_func r =
+    let r = match r with
+      | Reason.Rexpr_dep_type (_, p, e) ->
+          Reason.Rexpr_dep_type (root_r, p, e)
+      | _ -> r in
+    Reason.Rtype_access(reason, trail, r) in
+  let ty = reason_func root_r, root_ty in
+  let deps = List.map (fun (x, y) -> reason_func x, y) env.dep_tys in
+  let ty = ExprDepTy.apply deps ty in
+  env.tenv, (env.ety_env, ty)
 
 and expand env r (root, ids) =
   let ety_env = Phase.env_with_self env in
@@ -78,7 +82,7 @@ and expand env r (root, ids) =
 and expand_ env (root_reason, root_ty as root) =
   match env.ids with
   | [] ->
-      env, ExprDepTy.apply env.dep_tys root
+      env, root
   | head::tail -> begin match root_ty with
       | Tany -> env, root
       | Tabstract (AKdependent (`cls _, []), Some ty)
@@ -130,23 +134,22 @@ and expand_ env (root_reason, root_ty as root) =
 and create_root_from_type_constant env class_pos class_name root_ty (pos, tconst) =
   match get_typeconst env class_pos class_name pos tconst with
   | None -> env, (fst root_ty, Tany)
-  | Some (ety_env, typeconst) ->
+  | Some (env, typeconst) ->
       let env =
         { env with
           trail = (`cls class_name, List.map snd env.ids)::env.trail } in
-      let ety_env = { ety_env with this_ty = root_ty; from_class = None } in
+      (* The type constant itself may contain a 'this' type so we need to
+       * change the this_ty in the environment to be the root as an
+       * expression dependent type.
+       *)
+      let ety_env =
+        { env.ety_env with
+          this_ty = ExprDepTy.apply env.dep_tys root_ty;
+          from_class = None; } in
       begin
         match typeconst with
         | { ttc_type = Some ty; _ }
             when typeconst.ttc_constraint = None || env.dep_tys = [] ->
-            (* We are choosing the assigned type. The assigned type itself
-             * may contain a 'this' type so we need to change the this_ty in
-             * the environment to be the root as a dependent type.
-             *)
-            let ety_env =
-              { ety_env with
-                this_ty = ExprDepTy.apply env.dep_tys root_ty;
-                from_class = None; } in
             let tenv, ty = Phase.localize ~ety_env env.tenv ty in
             { env with dep_tys = []; tenv = tenv }, ty
         | {ttc_constraint = Some cstr; _} ->
@@ -190,14 +193,22 @@ and get_typeconst env class_pos class_name pos tconst =
      *)
     let cur_tconst = `cls class_name, List.map snd env.ids in
     let seen = ExprDepTy.to_string cur_tconst in
-    let expansions = (pos, seen)::env.ety_env.type_expansions in
+    let type_expansions = (pos, seen)::env.ety_env.type_expansions in
     if List.mem seen (List.map snd env.ety_env.type_expansions) then
       begin
-        let seen = expansions |> List.map snd |> List.rev in
+        let seen = type_expansions |> List.map snd |> List.rev in
         Errors.cyclic_typeconst (fst typeconst.ttc_name) seen;
         raise Exit
       end;
-    Some ({ env.ety_env with type_expansions = expansions }, typeconst)
+    (* If the class is final then we do not need to create dependent types
+     * because the type constant cannot be overridden by a child class
+     *)
+    let env =
+      { env with
+        ety_env = { env.ety_env with type_expansions };
+        dep_tys = if class_.tc_final then []  else env.dep_tys;
+      } in
+    Some (env, typeconst)
   with
     Exit -> None
 

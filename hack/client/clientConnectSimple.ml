@@ -14,7 +14,7 @@ type error =
   | Server_busy
   | Build_id_mismatch
 
-let server_exists root = not (Lock.check root "lock")
+let server_exists root = not (Lock.check (GlobalConfig.lock_file root))
 
 let wait_on_server_restart ic =
   try
@@ -29,7 +29,7 @@ let wait_on_server_restart ic =
      ()
 
 let establish_connection root =
-  let sock_name = Socket.get_path root in
+  let sock_name = Socket.get_path (GlobalConfig.socket_file root) in
   let sockaddr = Unix.ADDR_UNIX sock_name in
   Result.Ok (Unix.open_connection sockaddr)
 
@@ -41,7 +41,7 @@ let get_cstate (ic, oc) =
   with e ->
     Unix.shutdown_connection ic;
     close_in_noerr ic;
-    Result.Error Server_busy
+    raise e
 
 let verify_cstate ic = function
   | ServerUtils.Connection_ok -> Result.Ok ()
@@ -65,12 +65,14 @@ let connect_once root =
     Sys_utils.with_timeout 1
       ~on_timeout:(fun _ -> raise Exit)
       ~do_:begin fun () ->
-        ok_if_true (server_exists root) ~error:Server_missing >>= fun () ->
         establish_connection root >>= fun (ic, oc) ->
         get_cstate (ic, oc) >>= verify_cstate ic >>= fun () ->
         Ok (ic, oc)
       end
-  with _ ->
-    if not (Lock.check root "init")
+  with
+  | Exit_status.Exit_with _  as e -> raise e
+  | _ ->
+    if not (server_exists root) then Result.Error Server_missing
+    else if not (Lock.check (GlobalConfig.init_file root))
     then Result.Error Server_initializing
     else Result.Error Server_busy

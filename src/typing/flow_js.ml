@@ -127,73 +127,6 @@ end = struct
   let set _ops = ops := _ops
 end
 
-(* We maintain a stack of entries representing type applications processed
-   during calls to flow, for the purpose of terminating unbounded expansion of
-   type applications. Intuitively, we may have a potential infinite loop when
-   processing a type application leads to another type application with the same
-   root, but expanding type arguments. The entries in a stack contain
-   approximate measurements that allow us to detect such expansion.
-
-   An entry representing a type application with root C and type args T1,...,Tn
-   is of the form (C, [A1,...,An]), where each Ai is a list of the roots of type
-   applications nested in Ti. We consider a stack to indicate a potential
-   infinite loop when the top of the stack is (C, [A1,...,An]) and there is
-   another entry (C, [B1,...,Bn]) in the stack, such that each Bi is non-empty
-   and is contained in Ai. *)
-
-module TypeAppExpansion : sig
-  type entry
-  val push : context -> (Type.t * Type.t list) -> unit
-  val pop : unit -> unit
-  val get : unit -> entry list
-  val set : entry list -> unit
-  val loop : unit -> bool
-end = struct
-  type entry = Type.t * TypeSet.t list
-  let stack = ref ([]: entry list)
-
-  (* visitor to collect roots of type applications nested in a type *)
-  class roots_collector = object
-    inherit [TypeSet.t] type_visitor as super
-
-    method! type_ cx acc t = match t with
-    | TypeAppT (c, _) -> super#type_ cx (TypeSet.add c acc) t
-    | _ -> super#type_ cx acc t
-  end
-  let collect_roots cx = (new roots_collector)#type_ cx TypeSet.empty
-  let push cx (c, ts) =
-    stack := (c, List.map (collect_roots cx) ts) :: !stack
-  let pop () = stack := List.tl !stack
-  let get () = !stack
-  let set _stack = stack := _stack
-
-  (* Util to stringify a list, given a separator string and a function that maps
-     elements of the list to strings. Should probably be moved somewhere else
-     for general reuse. *)
-  let string_of_list list sep f =
-    list |> List.map f |> String.concat sep
-
-  (* show entries in the stack *)
-  let dump_stack () =
-    string_of_list !stack "\n" (fun (c, tss) ->
-      spf "%s<%s>" (desc_of_t c) (
-        string_of_list tss "," (fun ts ->
-          spf "[%s]" (string_of_list (TypeSet.elements ts) ";" desc_of_t)
-        )))
-
-  (* loop detector *)
-  let loop =
-    let contains ts1 ts2 =
-      not (TypeSet.is_empty ts1) && TypeSet.subset ts1 ts2
-    in fun () ->
-      match !stack with
-      | [] -> false
-      | (c, tss)::prev_stack ->
-        prev_stack |> List.exists (fun (prev_c, prev_tss) ->
-          c = prev_c && (List.for_all2 contains prev_tss tss)
-      )
-end
-
 let silent_warnings = false
 
 exception FlowError of (reason * string) list
@@ -1225,7 +1158,7 @@ let master_cx =
   let cx_ = ref None in
   fun () -> match !cx_ with
   | None ->
-    let cx = new_context (Files_js.get_flowlib_root ()) Files_js.lib_module in
+    let cx = new_context Files_js.global_file_name Files_js.lib_module in
     cx_ := Some cx;
     cx
   | Some cx -> cx
@@ -1279,15 +1212,103 @@ let debug_flow (l,u) =
 (* instantiation utils *)
 (***********************)
 
-(* Make a type argument for a given type parameter, given a reason. Note that
-   not all type arguments are tvars; the following function is used only when
-   polymorphic types need to be implicitly instantiated, because there was no
-   explicit instantiation (via a type application), or when we want to cache a
-   unique instantiation and unify it with other explicit instantiations. *)
-let mk_targ cx (typeparam, reason_op) =
-  mk_tvar cx (
-    prefix_reason (spf "type parameter %s of " typeparam.name) reason_op
-  )
+module ImplicitTypeArgument = struct
+  (* helpers *)
+  let add_typeparam_prefix s = spf "type parameter%s" s
+  let has_typeparam_prefix s =
+    (String.length s) >= 14 && (String.sub s 0 14) = "type parameter"
+
+  (* Make a type argument for a given type parameter, given a reason. Note that
+     not all type arguments are tvars; the following function is used only when
+     polymorphic types need to be implicitly instantiated, because there was no
+     explicit instantiation (via a type application), or when we want to cache a
+     unique instantiation and unify it with other explicit instantiations. *)
+  let mk_targ cx (typeparam, reason_op) =
+    let prefix_desc = add_typeparam_prefix (spf " %s of " typeparam.name) in
+    mk_tvar cx (prefix_reason prefix_desc reason_op)
+
+  (* Abstract a type argument that is created by implicit instantiation
+     above. Sometimes, these type arguments are involved in type expansion loops,
+     so we abstract them to detect such loops. *)
+  let abstract_targ tvar =
+    let reason, _ = open_tvar tvar in
+    let desc = desc_of_reason reason in
+    if has_typeparam_prefix desc
+    then Some (OpenT (reason_of_string desc, 0))
+    else None
+end
+
+(* We maintain a stack of entries representing type applications processed
+   during calls to flow, for the purpose of terminating unbounded expansion of
+   type applications. Intuitively, we may have a potential infinite loop when
+   processing a type application leads to another type application with the same
+   root, but expanding type arguments. The entries in a stack contain
+   approximate measurements that allow us to detect such expansion.
+
+   An entry representing a type application with root C and type args T1,...,Tn
+   is of the form (C, [A1,...,An]), where each Ai is a list of the roots of type
+   applications nested in Ti. We consider a stack to indicate a potential
+   infinite loop when the top of the stack is (C, [A1,...,An]) and there is
+   another entry (C, [B1,...,Bn]) in the stack, such that each Bi is non-empty
+   and is contained in Ai. *)
+
+module TypeAppExpansion : sig
+  type entry
+  val push_unless_loop : context -> (Type.t * Type.t list) -> bool
+  val pop : unit -> unit
+  val get : unit -> entry list
+  val set : entry list -> unit
+
+end = struct
+  type entry = Type.t * TypeSet.t list
+  let stack = ref ([]: entry list)
+
+  (* visitor to collect roots of type applications nested in a type *)
+  class roots_collector = object
+    inherit [TypeSet.t] type_visitor as super
+
+    method! type_ cx acc t = match t with
+    | TypeAppT (c, _) -> super#type_ cx (TypeSet.add c acc) t
+    | OpenT _ -> (match ImplicitTypeArgument.abstract_targ t with
+      | None -> acc
+      | Some t -> TypeSet.add t acc
+      )
+    | _ -> super#type_ cx acc t
+  end
+  let collect_roots cx = (new roots_collector)#type_ cx TypeSet.empty
+
+  (* Util to stringify a list, given a separator string and a function that maps
+     elements of the list to strings. Should probably be moved somewhere else
+     for general reuse. *)
+  let string_of_list list sep f =
+    list |> List.map f |> String.concat sep
+
+  (* show entries in the stack *)
+  let dump_stack () =
+    string_of_list !stack "\n" (fun (c, tss) ->
+      spf "%s<%s>" (desc_of_t c) (
+        string_of_list tss "," (fun ts ->
+          spf "[%s]" (string_of_list (TypeSet.elements ts) ";" desc_of_t)
+        )))
+
+  (* Detect whether pushing would cause a loop. Push only if no loop is
+     detected, and return whether push happened. *)
+  let push_unless_loop =
+    let contains ts1 ts2 =
+      not (TypeSet.is_empty ts1) && TypeSet.subset ts1 ts2
+    in
+    fun cx (c, ts) ->
+      let tss = List.map (collect_roots cx) ts in
+      let loop = !stack |> List.exists (fun (prev_c, prev_tss) ->
+        c = prev_c && (List.for_all2 contains prev_tss tss)
+      ) in
+      if loop then false
+      else (stack := (c, tss) :: !stack; true)
+
+  let pop () = stack := List.tl !stack
+  let get () = !stack
+  let set _stack = stack := _stack
+end
 
 module Cache = struct
   (* Cache that remembers pairs of types that are passed to __flow__. *)
@@ -1318,7 +1339,7 @@ module Cache = struct
       try
         Hashtbl.find cache (typeparam.reason, reason_op)
       with _ ->
-        let t = mk_targ cx (typeparam, reason_op) in
+        let t = ImplicitTypeArgument.mk_targ cx (typeparam, reason_op) in
         Hashtbl.add cache (typeparam.reason, reason_op) t;
         t
   end
@@ -1721,10 +1742,10 @@ let rec __flow cx (l, u) trace =
     (* summary types forget literal information *)
     (********************************************)
 
-    | (StrT (_, Some _), SummarizeT (reason, t)) ->
+    | (StrT (_, (Literal _ | Truthy | Falsy)), SummarizeT (reason, t)) ->
       rec_unify cx trace (StrT.why reason) t
 
-    | (NumT (_, Some _), SummarizeT (reason, t)) ->
+    | (NumT (_, (Literal _ | Truthy | Falsy)), SummarizeT (reason, t)) ->
       rec_unify cx trace (NumT.why reason) t
 
     | (_, SummarizeT (reason, t)) ->
@@ -1848,10 +1869,10 @@ let rec __flow cx (l, u) trace =
     (* type applications *)
     (*********************)
 
-    (* Sometimes a polymorphic class may have a field or method whose return
-       type is a type application on the same polymorphic class, but
-       expanded. See Array#concat, e.g. It is not unusual for programmers to
-       reuse variables, assigning the result of a field get or a method call on
+    (* Sometimes a polymorphic class may have a polymorphic method whose return
+       type is a type application on the same polymorphic class, possibly
+       expanded. See Array#map or Array#concat, e.g. It is not unusual for
+       programmers to reuse variables, assigning the result of a method call on
        a variable to itself, in which case we could get into cycles of unbounded
        instantiation. We use caching to cut these cycles. Caching relies on
        reasons (see module Cache.I). This is OK since intuitively, there should
@@ -1867,14 +1888,13 @@ let rec __flow cx (l, u) trace =
        because substitution of type parameters in def types does not affect
        their reasons, so we'd trivially lose precision. *)
 
-    | (TypeAppT(c,ts), (GetT _ | MethodT _)) ->
+    | (TypeAppT(c,ts), MethodT _) ->
         let reason_op = reason_of_t u in
         let t = mk_typeapp_instance cx reason_op ~cache:true c ts in
         rec_flow cx trace (t, u)
 
     | (TypeAppT(c,ts), _) ->
-        if not (TypeAppExpansion.loop()) then (
-          TypeAppExpansion.push cx (c, ts);
+        if TypeAppExpansion.push_unless_loop cx (c, ts) then (
           let reason = reason_of_t u in
           let t = mk_typeapp_instance cx reason c ts in
           rec_flow cx trace (t, u);
@@ -1882,8 +1902,7 @@ let rec __flow cx (l, u) trace =
         )
 
     | (_, TypeAppT(c,ts)) ->
-        if not (TypeAppExpansion.loop()) then (
-          TypeAppExpansion.push cx (c, ts);
+        if TypeAppExpansion.push_unless_loop cx (c, ts) then (
           let reason = reason_of_t l in
           let t = mk_typeapp_instance cx reason c ts in
           rec_flow cx trace (l, t);
@@ -1917,16 +1936,16 @@ let rec __flow cx (l, u) trace =
     (* string singletons *)
     (**********************)
 
-    | (StrT (_, Some x), SingletonStrT (_, key)) ->
+    | (StrT (_, Literal x), SingletonStrT (_, key)) ->
         if x <> key then
           let msg = spf "Expected string literal %s, got %s instead" key x in
           prerr_flow cx trace msg l u
 
-    | (StrT (_, None), SingletonStrT (_, key)) ->
+    | (StrT (_, (Truthy | Falsy | AnyLiteral)), SingletonStrT (_, key)) ->
       prerr_flow cx trace (spf "Expected string literal %s" key) l u
 
     | (SingletonStrT (reason, key), _) ->
-      rec_flow cx trace (StrT(reason, Some key), u)
+      rec_flow cx trace (StrT(reason, Literal key), u)
 
     (*********************)
     (* number singletons *)
@@ -1936,17 +1955,17 @@ let rec __flow cx (l, u) trace =
         looks like a single number literal. This contrasts with
         `NumT(_, Some num)`, which starts out representing `num` but allows any
         number, whereas `SingletonNumT` accepts only exactly that value. **)
-    | (NumT (_, Some (x, _)), SingletonNumT (_, (y, _))) ->
+    | (NumT (_, Literal (x, _)), SingletonNumT (_, (y, _))) ->
         (* this equality check is ok for now because we don't do arithmetic *)
         if x <> y then
           let msg = spf "Expected number literal %.16g, got %.16g instead" y x in
           prerr_flow cx trace msg l u
 
-    | (NumT (_, None), SingletonNumT (_, (y, _))) ->
+    | (NumT (_, (Truthy | Falsy | AnyLiteral)), SingletonNumT (_, (y, _))) ->
       prerr_flow cx trace (spf "Expected number literal %.16g" y) l u
 
     | (SingletonNumT (reason, lit), _) ->
-      rec_flow cx trace (NumT(reason, Some lit), u)
+      rec_flow cx trace (NumT(reason, Literal lit), u)
 
     (**********************)
     (* boolean singletons *)
@@ -1972,12 +1991,12 @@ let rec __flow cx (l, u) trace =
     (* keys (NOTE: currently we only support string keys *)
     (*****************************************************)
 
-    | (StrT (reason_s, Some x), KeysT (reason_op, o)) ->
+    | (StrT (reason_s, Literal x), KeysT (reason_op, o)) ->
       let reason_op = replace_reason (spf "string literal %s" x) reason_s in
       (* check that o has key x *)
       rec_flow cx trace (o, HasKeyT(reason_op,x))
 
-    | (StrT (_, None), KeysT _) ->
+    | (StrT (_, (Truthy | Falsy | AnyLiteral)), KeysT _) ->
       prerr_flow cx trace "Expected string literal" l u
 
     | (KeysT (reason1, o1), _) ->
@@ -2012,7 +2031,7 @@ let rec __flow cx (l, u) trace =
     | (ObjT (reason, { props_tmap = mapr; _ }), GetKeysT(_,key)) ->
       (* flow each key of l to key *)
       iter_props cx mapr (fun x tv ->
-        let t = StrT (reason, Some x) in
+        let t = StrT (reason, Literal x) in
         rec_flow cx trace (t, key)
       )
 
@@ -2021,7 +2040,7 @@ let rec __flow cx (l, u) trace =
       let methods_tmap = find_props cx instance.methods_tmap in
       let fields = SMap.union fields_tmap methods_tmap in
       fields |> SMap.iter (fun x tv ->
-        let t = StrT (reason, Some x) in
+        let t = StrT (reason, Literal x) in
         rec_flow cx trace (t, key)
       )
 
@@ -2324,12 +2343,36 @@ let rec __flow cx (l, u) trace =
     (* matching shapes of objects *)
     (******************************)
 
-    | (_, ShapeT (o2)) ->
-        let reason = reason_of_t o2 in
-        rec_flow cx trace (l, ObjAssignT(reason, o2, AnyT.t, [], false))
+    (** When something of type ShapeT(o) is used, it behaves like it had type o.
 
-    | (ShapeT (o1), _) ->
-        rec_flow cx trace (o1, u)
+        On the other hand, things that can be passed to something of type
+        ShapeT(o) must be "subobjects" of o: they may have fewer properties, but
+        those properties should be transferable to o.
+
+        Because a property x with a type OptionalT(t) could be considered
+        missing or having type t, we consider such a property to be transferable
+        if t is a subtype of x's type in o. Otherwise, the property should be
+        assignable to o.
+
+        TODO: The type constructors ShapeT, DiffT, ObjAssignT, ObjRestT express
+        related meta-operations on objects. Considate these meta-operations and
+        ensure consistency of their semantics. **)
+
+    | (ShapeT (o), _) ->
+        rec_flow cx trace (o, u)
+
+    | (ObjT (_, { props_tmap = mapr; _ }), ShapeT (proto)) ->
+        let reason = reason_of_t proto in
+        iter_props cx mapr (fun x t ->
+          let reason = prefix_reason (spf "prop %s of " x) reason in
+          let tvar = mk_tvar cx reason in
+          rec_flow cx trace (t, OptionalT(tvar));
+          rec_flow cx trace (proto, SetT (reason, x, tvar));
+        )
+
+    | (_, ShapeT (o)) ->
+        let reason = reason_of_t o in
+        rec_flow cx trace (l, ObjAssignT(reason, o, AnyT.t, [], false))
 
     | (_, DiffT (o1, o2)) ->
         let reason = reason_of_t o2 in
@@ -2345,6 +2388,25 @@ let rec __flow cx (l, u) trace =
       let lit = (desc_of_reason r1) = "array literal" in
       array_flow cx trace lit (ts1, t1, ts2, t2)
 
+    (**************************************************)
+    (* instances of classes follow declared hierarchy *)
+    (**************************************************)
+
+    | (InstanceT (_, _, _, instance),
+       InstanceT (_, _, _, instance_super))
+      when not instance_super.structural
+        || instance.class_id = instance_super.class_id ->
+      rec_flow cx trace (l, ExtendsT(l,u))
+
+    | (InstanceT (_,_,super,instance),
+       ExtendsT(_, InstanceT (_,_,_,instance_super))) ->
+
+      if instance.class_id = instance_super.class_id
+      then
+        flow_type_args cx trace instance instance_super
+      else
+        rec_flow cx trace (super, u)
+
     (***************************************************************)
     (* Enable structural subtyping for upperbounds like interfaces *)
     (***************************************************************)
@@ -2358,22 +2420,6 @@ let rec __flow cx (l, u) trace =
        }))
       ->
       structural_subtype cx trace l (reason1, super, fields_tmap, methods_tmap)
-
-    (**************************************************)
-    (* instances of classes follow declared hierarchy *)
-    (**************************************************)
-
-    | (InstanceT _, InstanceT _) ->
-      rec_flow cx trace (l, ExtendsT(l,u))
-
-    | (InstanceT (_,_,super,instance),
-       ExtendsT(_, InstanceT (_,_,_,instance_super))) ->
-
-      if instance.class_id = instance_super.class_id
-      then
-        flow_type_args cx trace instance instance_super
-      else
-        rec_flow cx trace (super, u)
 
     (********************************************************)
     (* runtime types derive static types through annotation *)
@@ -2786,7 +2832,7 @@ let rec __flow cx (l, u) trace =
       ->
       rec_flow cx trace (key, ElemT(reason_op, l, LowerBoundT tout))
 
-    | (StrT (_, Some x), ElemT(reason_op, (ObjT _ as o), t)) ->
+    | (StrT (_, Literal x), ElemT(reason_op, (ObjT _ as o), t)) ->
       (match t with
       | UpperBoundT tin -> rec_flow cx trace (o, SetT(reason_op,x,tin))
       | LowerBoundT tout -> rec_flow cx trace (o, GetT(reason_op,x,tout))
@@ -2809,7 +2855,7 @@ let rec __flow cx (l, u) trace =
        ElemT(reason_op, ArrT(_, value, ts), t))
       ->
       let value = match literal with
-      | Some (float_value, _) ->
+      | Literal (float_value, _) ->
           begin try
             float_value
             |> int_of_float
@@ -2817,7 +2863,7 @@ let rec __flow cx (l, u) trace =
           with _ ->
             value
           end
-      | None -> value
+      | _ -> value
       in
       (match t with
       | UpperBoundT tin -> rec_flow cx trace (tin, value)
@@ -3094,7 +3140,12 @@ let rec __flow cx (l, u) trace =
             possible deluge of shadow properties on Object.prototype, since it
             is shared by every object. **)
         rec_flow cx trace (get_builtin_type cx reason "Object", u)
-      else if Files_js.is_lib_file_or_flowlib_root (abs_path_of_reason reason)
+
+      (* if we're looking something up on the global/builtin object, then tweak
+         the error to say that `x` doesn't exist. We can tell this is the global
+         object because that should be the only object created with
+         `builtin_reason` instead of an actual location (see `Init_js.init`). *)
+      else if is_builtin_reason reason
       then
         let msg =
           if is_internal_module_name x
@@ -3209,12 +3260,6 @@ and flow_eq cx trace reason l r =
   else match (l, r) with
   | (_, _) when equatable cx trace (l, r) -> ()
   | (_, _) -> prerr_flow cx trace "Cannot be compared to" l r
-
-and abs_path_of_reason r =
-  let loc = loc_of_reason r in
-  match Loc.(loc.source) with
-  | Some filename -> filename
-  | None -> ""
 
 and is_object_prototype_method = function
   | "hasOwnProperty"
@@ -3614,7 +3659,7 @@ and cache_instantiate cx trace cache (typeparam, reason_op) t =
 and instantiate_poly ?(weak=false) cx trace reason_op (xs,t) =
   let ts = xs |> List.map (fun typeparam ->
     if weak then AnyT.why reason_op
-    else mk_targ cx (typeparam, reason_op)
+    else ImplicitTypeArgument.mk_targ cx (typeparam, reason_op)
   )
   in
   instantiate_poly_with_targs cx trace reason_op (xs,t) ts
@@ -3758,7 +3803,8 @@ and ensure_prop_ cx trace strict mapr x proto reason_obj reason_op =
 and lookup_prop cx trace l reason strict x t =
   let l =
     (* munge names beginning with single _ *)
-    if (Str.string_match (Str.regexp_string "_") x 0) &&
+    if (modes.munge_underscores &&
+      Str.string_match (Str.regexp_string "_") x 0) &&
       not (Str.string_match (Str.regexp_string "__") x 0)
     then MixedT (reason_of_t l)
     else l
@@ -3826,15 +3872,15 @@ and filter_exists = function
   | NullT r
   | VoidT r
   | BoolT (r, Some false)
-  | StrT (r, Some "")
-  | NumT (r, Some (0., _)) -> UndefT r
+  | StrT (r, (Literal "" | Falsy))
+  | NumT (r, (Literal (0., _) | Falsy)) -> UndefT r
 
   (* unknown things become truthy *)
   | MaybeT t -> t
   | OptionalT t -> filter_exists t
   | BoolT (r, None) -> BoolT (r, Some true)
-  | StrT (r, None) -> StrT (r, Some "truthy") (* hmmmm *)
-  | NumT (r, None) -> NumT (r, Some (1., "truthy")) (* hmmmm *)
+  | StrT (r, AnyLiteral) -> StrT (r, Truthy)
+  | NumT (r, AnyLiteral) -> NumT (r, Truthy)
 
   (* truthy things pass through *)
   | t -> t
@@ -3844,26 +3890,26 @@ and filter_not_exists t = match t with
   | NullT _
   | VoidT _
   | BoolT (_, Some false)
-  | StrT (_, Some "")
-  | NumT (_, Some (0., _)) -> t
+  | StrT (_, (Literal "" | Falsy))
+  | NumT (_, (Literal (0., _) | Falsy)) -> t
 
   (* truthy things get removed *)
   | BoolT (r, Some _)
-  | StrT (r, Some _)
+  | StrT (r, (Literal _ | Truthy))
   | ArrT (r, _, _)
   | ObjT (r, _)
   | AnyObjT r
   | FunT (r, _, _, _)
   | AnyFunT r
-  | NumT (r, Some _) -> UndefT r
+  | NumT (r, (Literal _ | Truthy)) -> UndefT r
 
   (* unknown boolies become falsy *)
   | MaybeT t ->
     let reason = reason_of_t t in
     UnionT (reason, [NullT.why reason; VoidT.why reason])
   | BoolT (r, None) -> BoolT (r, Some false)
-  | StrT (r, None) -> StrT (r, Some "")
-  | NumT (r, None) -> NumT (r, Some (0., "0"))
+  | StrT (r, AnyLiteral) -> StrT (r, Falsy)
+  | NumT (r, AnyLiteral) -> NumT (r, Falsy)
 
   (* things that don't track truthiness pass through *)
   | t -> t
@@ -4259,10 +4305,10 @@ and sentinel_prop_test key cx trace result = function
       set up so that filtering ultimately only depends on what flows to
       result. **)
   (* obj.key ===/!== string value *)
-  | (sense, (ObjT (_, { props_tmap; _}) as obj), StrT (_, Some value)) ->
+  | (sense, (ObjT (_, { props_tmap; _}) as obj), StrT (_, Literal value)) ->
       (match read_prop_opt cx props_tmap key with
         | Some (SingletonStrT (_, v))
-        | Some (StrT (_, Some v)) when (value = v) != sense ->
+        | Some (StrT (_, Literal v)) when (value = v) != sense ->
             (* provably unreachable, so prune *)
             ()
         | _ ->
@@ -4273,10 +4319,10 @@ and sentinel_prop_test key cx trace result = function
       )
 
   (* obj.key ===/!== number value *)
-  | (sense, (ObjT (_, { props_tmap; _}) as obj), NumT (_, Some (value, _))) ->
+  | (sense, (ObjT (_, { props_tmap; _}) as obj), NumT (_, Literal (value, _))) ->
       (match read_prop_opt cx props_tmap key with
         | Some (SingletonNumT (_, (v, _)))
-        | Some (NumT (_, Some (v, _))) when (value = v) != sense ->
+        | Some (NumT (_, Literal (v, _))) when (value = v) != sense ->
             (* provably unreachable, so prune *)
             ()
         | _ ->
@@ -4745,7 +4791,7 @@ and dictionary cx trace keyt valuet = function
   | Some { key; value; _ } ->
       rec_flow cx trace (keyt, key);
       begin match keyt with
-      | StrT (_, Some str) ->
+      | StrT (_, Literal str) ->
         (* Object.prototype methods are exempt from the dictionary rules *)
         if not (is_object_prototype_method str)
         then rec_flow cx trace (valuet, value)
@@ -4756,7 +4802,7 @@ and dictionary cx trace keyt valuet = function
 and string_key s reason =
   let key_reason =
     replace_reason (spf "property name \"%s\" is a string" s) reason in
-  StrT (key_reason, Some s)
+  StrT (key_reason, Literal s)
 
 (* builtins, contd. *)
 
@@ -5381,51 +5427,6 @@ let analyze_dependencies cx ins out =
     find_dependencies dep_map ins out
   ) else SSet.empty
 
-(* TODO: Think of a better place to put this *)
-let rec extract_members cx this_t =
-  match this_t with
-  | MaybeT t ->
-      (* TODO: do we want to autocomplete when the var could be null? *)
-      (*extract_members cx t*)
-      SMap.empty
-  | InstanceT (reason, _, super,
-              {fields_tmap = fields;
-               methods_tmap = methods;
-               _}) ->
-      let fields = find_props cx fields in
-      let methods = find_props cx methods in
-      let super_t = resolve_type cx super in
-      let members = SMap.union fields methods in
-      let super_flds = extract_members cx super_t in
-      SMap.union super_flds members
-  | ObjT (_, {props_tmap = flds; proto_t = proto; _}) ->
-      let proto_t = resolve_type cx proto in
-      let prot_members = extract_members cx proto_t in
-      let members = find_props cx flds in
-      SMap.union prot_members members
-  | TypeAppT (c, ts) ->
-      let c = resolve_type cx c in
-      let inst_t = instantiate_poly_t cx c ts in
-      let inst_t = instantiate_type inst_t in
-      extract_members cx inst_t
-  | PolyT (type_params, sub_type) ->
-      (* TODO: replace type parameters with stable/proper names? *)
-      extract_members cx sub_type
-  | ClassT (InstanceT (_, static, _, _)) ->
-      let static_t = resolve_type cx static in
-      extract_members cx static_t
-  | ClassT t ->
-      (* TODO: Can this happen? *)
-      extract_members cx t
-  | IntersectionT (r, ts)
-  | UnionT (r, ts) ->
-      let ts = List.map (resolve_type cx) ts in
-      let members = List.map (extract_members cx) ts in
-      intersect_members cx members
-  | _ ->
-      (* TODO: What types could come up here which we need to handle? *)
-      SMap.empty
-
 and intersect_members cx members =
   match members with
   | [] -> SMap.empty
@@ -5443,3 +5444,85 @@ and intersect_members cx members =
       SMap.map (List.fold_left (fun acc x ->
           merge_type cx (acc, x)
         ) UndefT.t) map
+
+(* It's kind of lame that Autocomplete is in this module, but it uses a bunch
+ * of internal APIs so for now it's easier to keep it here than to expose those
+ * APIs *)
+module Autocomplete : sig
+  type member_result =
+    | Success of Type.t SMap.t
+    | FailureMaybeType
+    | FailureUnhandledType of Type.t
+
+  val map_of_member_result: member_result -> Type.t SMap.t
+
+  val extract_members: context -> Type.t -> member_result
+
+end = struct
+
+  type member_result =
+    | Success of Type.t SMap.t
+    | FailureMaybeType
+    | FailureUnhandledType of Type.t
+
+  let map_of_member_result = function
+    | Success map -> map
+    | FailureMaybeType
+    | FailureUnhandledType _ ->
+        SMap.empty
+
+  (* TODO: Think of a better place to put this *)
+  let rec extract_members cx this_t =
+    match this_t with
+    | MaybeT t ->
+        (* TODO: do we want to autocomplete when the var could be null? *)
+        FailureMaybeType
+    | InstanceT (reason, _, super,
+                {fields_tmap = fields;
+                methods_tmap = methods;
+                _}) ->
+        let fields = find_props cx fields in
+        let methods = find_props cx methods in
+        let super_t = resolve_type cx super in
+        let members = SMap.union fields methods in
+        let super_flds = extract_members_as_map cx super_t in
+        Success (SMap.union super_flds members)
+    | ObjT (_, {props_tmap = flds; proto_t = proto; _}) ->
+        let proto_t = resolve_type cx proto in
+        let prot_members = extract_members_as_map cx proto_t in
+        let members = find_props cx flds in
+        Success (SMap.union prot_members members)
+    | TypeAppT (c, ts) ->
+        let c = resolve_type cx c in
+        let inst_t = instantiate_poly_t cx c ts in
+        let inst_t = instantiate_type inst_t in
+        extract_members cx inst_t
+    | PolyT (type_params, sub_type) ->
+        (* TODO: replace type parameters with stable/proper names? *)
+        extract_members cx sub_type
+    | ClassT (InstanceT (_, static, _, _)) ->
+        let static_t = resolve_type cx static in
+        extract_members cx static_t
+    | ClassT t ->
+        (* TODO: Can this happen? *)
+        extract_members cx t
+    | IntersectionT (r, ts) ->
+        (* Intersection type should autocomplete for every property of every type
+        * in the intersection *)
+        let ts = List.map (resolve_type cx) ts in
+        let members = List.map (extract_members_as_map cx) ts in
+        Success (List.fold_left SMap.union SMap.empty members)
+    | UnionT (r, ts) ->
+        (* Union type should autocomplete for only the properties that are in
+        * every type in the intersection *)
+        let ts = List.map (resolve_type cx) ts in
+        let members = List.map (extract_members_as_map cx) ts in
+        Success (intersect_members cx members)
+    | _ ->
+        (* TODO: What types could come up here which we need to handle? *)
+        FailureUnhandledType this_t
+
+  and extract_members_as_map cx this_t =
+    let member_result = extract_members cx this_t in
+    map_of_member_result member_result
+end

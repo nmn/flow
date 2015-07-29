@@ -345,18 +345,11 @@ and Statement : sig
     }
   end
   module Interface : sig
-    module Extends : sig
-      type t = Loc.t * t'
-      and t' = {
-        id: Identifier.t;
-        typeParameters: Type.ParameterInstantiation.t option;
-      }
-    end
     type t = {
       id: Identifier.t;
       typeParameters: Type.ParameterDeclaration.t option;
       body: Loc.t * Type.Object.t;
-      extends: Extends.t list;
+      extends: (Loc.t * Type.Generic.t) list;
     }
   end
   module DeclareVariable : sig
@@ -913,8 +906,13 @@ end = Comment
 and Class : sig
   module Method : sig
     type t = Loc.t * t'
+    and kind =
+      | Constructor
+      | Method
+      | Get
+      | Set
     and t' = {
-      kind: Expression.Object.Property.kind;
+      kind: kind;
       key: Expression.Object.Property.key;
       value: Loc.t * Expression.Function.t;
       static: bool;
@@ -924,7 +922,8 @@ and Class : sig
     type t = Loc.t * t'
     and t' = {
       key: Expression.Object.Property.key;
-      typeAnnotation: Type.annotation;
+      value: Expression.t option;
+      typeAnnotation: Type.annotation option;
       static: bool;
     }
   end

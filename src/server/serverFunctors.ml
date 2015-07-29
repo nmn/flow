@@ -17,19 +17,6 @@ module List = Core_list
 exception State_not_found
 
 module type SERVER_PROGRAM = sig
-  module EventLogger : sig
-    val init: Path.t -> float -> unit
-    val init_done: string -> unit
-    val load_script_done: unit -> unit
-    val load_read_end: string -> unit
-    val load_recheck_end: float -> int -> unit
-    val load_failed: string -> unit
-    val lock_lost: Path.t -> string -> unit
-    val lock_stolen: Path.t -> string -> unit
-    val out_of_date: unit -> unit
-    val recheck_end: float -> int -> int -> unit
-  end
-
   val preinit : unit -> unit
   val init : genv -> env -> env
   val run_once_and_exit : genv -> env -> unit
@@ -62,14 +49,14 @@ end = struct
     exit 1
 
   let grab_lock root =
-    if not (Lock.grab root "lock")
+    if not (Lock.grab (FlowConfig.lock_file root))
     then other_server_running()
 
   let grab_init_lock root =
-    ignore(Lock.grab root "init")
+    ignore(Lock.grab (FlowConfig.init_file root))
 
   let release_init_lock root =
-    ignore(Lock.release root "init")
+    ignore(Lock.release (FlowConfig.init_file root))
 
   (* This code is only executed when the options --check is NOT present *)
   let go options init_fun =
@@ -110,7 +97,7 @@ end = struct
       let client_build_id = input_line ic in
       if client_build_id <> Build_id.build_id_ohai then begin
         msg_to_channel oc Build_id_mismatch;
-        Program.EventLogger.out_of_date ();
+        FlowEventLogger.out_of_date ();
         Printf.eprintf "Status: Error\n";
         Printf.eprintf "%s is out of date. Exiting.\n" Program.name;
         exit 4
@@ -175,22 +162,20 @@ end = struct
     let root = Options.root genv.options in
     let env = ref env in
     while true do
-      if not (Lock.check root "lock") then begin
+      let lock_file = FlowConfig.lock_file root in
+      if not (Lock.check lock_file) then begin
         Hh_logger.log "Lost %s lock; reacquiring.\n" Program.name;
-        Program.EventLogger.lock_lost root "lock";
-        if not (Lock.grab root "lock")
+        FlowEventLogger.lock_lost lock_file;
+        if not (Lock.grab lock_file)
         then
           Hh_logger.log "Failed to reacquire lock; terminating.\n";
-          Program.EventLogger.lock_stolen root "lock";
+          FlowEventLogger.lock_stolen lock_file;
           die()
       end;
       ServerPeriodical.call_before_sleeping();
       let has_client = sleep_and_check socket in
-      let start_t = Unix.time () in
       let loop_count, rechecked_count, new_env = recheck_loop genv !env in
       env := new_env;
-      if rechecked_count > 0
-      then Program.EventLogger.recheck_end start_t loop_count rechecked_count;
       if has_client then handle_connection genv !env socket;
       ServerEnv.invoke_async_queue ();
       EventLogger.flush ();
@@ -198,7 +183,7 @@ end = struct
 
   let create_program_init genv env = fun () ->
     let env = Program.init genv env in
-    Program.EventLogger.init_done "fresh";
+    FlowEventLogger.init_done ();
     env
 
   (* The main entry point of the daemon
@@ -209,14 +194,14 @@ end = struct
   *)
   let main options =
     let root = Options.root options in
-    Program.EventLogger.init root (Unix.time ());
+    FlowEventLogger.init_server root;
     Program.preinit ();
     SharedMem.(init default_config);
     (* this is to transform SIGPIPE in an exception. A SIGPIPE can happen when
     * someone C-c the client.
     *)
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-    PidLog.init root;
+    PidLog.init (FlowConfig.pids_file root);
     PidLog.log ~reason:"main" (Unix.getpid());
     let watch_paths = root :: Program.get_watch_paths options in
     let genv =
@@ -229,7 +214,7 @@ end = struct
       Program.run_once_and_exit genv env
     else
       let env = MainInit.go options program_init in
-      let socket = Socket.init_unix_socket root in
+      let socket = Socket.init_unix_socket (FlowConfig.socket_file root) in
       serve genv env socket
 
   let daemonize options =

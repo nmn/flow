@@ -44,6 +44,7 @@ let init_modes opts = Options.(
   modes.quiet <- opts.opt_quiet;
   modes.profile <- opts.opt_profile;
   modes.no_flowlib <- opts.opt_no_flowlib;
+  modes.munge_underscores <- opts.opt_munge_underscores;
   (* TODO: confirm that only master uses strip_root, otherwise set it! *)
   Module_js.init opts;
   Files_js.init opts.opt_libs
@@ -164,7 +165,7 @@ let filter_suppressed_errors = Errors_js.(
 
 let strip_root_from_reason_list root list =
   List.map (
-    fun (reason, s) -> (Reason_js.strip_root reason root, s)
+    fun (reason, s) -> (Reason_js.strip_root root reason, s)
   ) list
 
 let strip_root_from_error root error =
@@ -235,9 +236,12 @@ let collate_errors files =
   let all = SMap.fold distrib_errs !module_errors all in
   all_errors := all
 
+let profile_and_not_quiet opts =
+  Options.(opts.opt_profile && not opts.opt_quiet)
+
 let wraptime opts pred msg f =
-  if opts.Options.opt_quiet || not opts.Options.opt_profile then f ()
-  else time pred msg f
+  if profile_and_not_quiet opts then time pred msg f
+  else f()
 
 let checktime opts limit msg f =
   wraptime opts (fun t -> t > limit) msg f
@@ -414,7 +418,7 @@ let merge_strict_file file =
   (* always use cache to read contexts, instead of directly
      using ContextHeap; otherwise bad things will happen. *)
   let cx = cache#read file in
-  let master_cx = cache#read (Files_js.get_flowlib_root ()) in
+  let master_cx = cache#read Files_js.global_file_name in
   merge_strict_context cache cx master_cx
 
 let typecheck_contents contents filename =
@@ -422,7 +426,7 @@ let typecheck_contents contents filename =
   | OK ast ->
       let cx = TI.infer_ast ast filename true in
       let cache = new context_cache in
-      let master_cx = cache#read (Files_js.get_flowlib_root ()) in
+      let master_cx = cache#read Files_js.global_file_name in
       Some (merge_strict_context cache cx master_cx), cx.errors
   | Err errors ->
       None, errors
@@ -506,12 +510,10 @@ let merge_nonstrict partition opts =
 (* calculate module dependencies *)
 let calc_dependencies files =
   let deps = List.fold_left (fun err_map file ->
-    let { Module._module = m; required = reqs; _ } =
-      Module.get_module_info file in
-    SMap.add m (file, reqs) err_map
+    let { Module._module; required; _ } = Module.get_module_info file in
+    SMap.add _module required err_map
   ) SMap.empty files in
-  let (_, partition) = Sort_js.topsort deps in
-  partition
+  Sort_js.topsort deps
 
 (* commit newly inferred and removed modules, collect errors. *)
 let commit_modules inferred removed =
@@ -538,14 +540,19 @@ let typecheck workers files removed unparsed opts make_merge_input =
   (* call supplied function to calculate closure of modules to merge *)
   match make_merge_input inferred with
   | true, to_merge ->
+    let partition = calc_dependencies to_merge in
+    if profile_and_not_quiet opts then Sort_js.log partition;
     (if modes.strict then (
       try
         merge_strict workers to_merge opts
       with exc ->
         prerr_endline (Printexc.to_string exc)
      ) else (
-      let partition = calc_dependencies to_merge in
-      merge_nonstrict partition opts
+      let levels =
+        IMap.fold (fun i mcs levels ->
+          (List.concat mcs)::levels
+        ) partition [] in
+      merge_nonstrict levels opts;
     ));
     (* collate errors by origin *)
     collate_errors to_merge;

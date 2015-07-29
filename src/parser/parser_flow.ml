@@ -213,10 +213,11 @@ end = struct
     val _type : env -> Ast.Type.t
     val type_parameter_declaration : env -> Ast.Type.ParameterDeclaration.t option
     val type_parameter_instantiation : env -> Ast.Type.ParameterInstantiation.t option
-    val return_type : env -> Ast.Type.annotation option
+    val generic : env -> Loc.t * Ast.Type.Generic.t
     val _object : ?allow_static:bool -> env -> Loc.t * Type.Object.t
     val function_param_list : env -> Type.Function.Param.t option * Type.Function.Param.t list
     val annotation : env -> Ast.Type.annotation
+    val annotation_opt : env -> Ast.Type.annotation option
   end = struct
     type param_list_or_type =
       | ParamList of (Type.Function.Param.t option * Type.Function.Param.t list)
@@ -320,7 +321,9 @@ end = struct
           let t = primary env in
           Loc.btwn start_loc (fst t), Type.Typeof t
       | T_LBRACKET -> tuple env
-      | T_IDENTIFIER -> generic env
+      | T_IDENTIFIER ->
+          let loc, g = generic env in
+          loc, Type.Generic g
       | T_STRING (loc, value, raw, octal)  ->
           if octal then strict_error env Error.StrictOctalLiteral;
           Expect.token env (T_STRING (loc, value, raw, octal));
@@ -498,7 +501,7 @@ end = struct
       | _ ->
           Type (union_with env
                   (intersection_with env
-                    (postfix_with env (generic_with_identifier env id)))
+                    (postfix_with env (generic_type_with_identifier env id)))
                 )
 
     and function_or_group env =
@@ -688,9 +691,9 @@ end = struct
             }))
           end else None
 
-    and generic env = generic_with_identifier env (Parse.identifier env)
+    and generic env = raw_generic_with_identifier env (Parse.identifier env)
 
-    and generic_with_identifier =
+    and raw_generic_with_identifier =
       let rec identifier env (q_loc, qualification) =
         if Peek.token env = T_PERIOD
         then begin
@@ -711,12 +714,16 @@ end = struct
         let loc = match typeParameters with
         | None -> id_loc
         | Some (loc, _) -> Loc.btwn id_loc loc in
-        loc, Type.(Generic Generic.({
+        loc, Type.Generic.({
           id;
           typeParameters;
-        }))
+        })
 
-    and return_type env =
+    and generic_type_with_identifier env id =
+      let loc, generic = raw_generic_with_identifier env id in
+      loc, Type.Generic generic
+
+    and annotation_opt env =
       match Peek.token env with
       | T_COLON -> Some (annotation env)
       | _ -> None
@@ -731,10 +738,11 @@ end = struct
     let _type = wrap _type
     let type_parameter_declaration = wrap type_parameter_declaration
     let type_parameter_instantiation = wrap type_parameter_instantiation
-    let return_type = wrap return_type
     let _object ?(allow_static=false) env = wrap (_object ~allow_static) env
     let function_param_list = wrap function_param_list
     let annotation = wrap annotation
+    let annotation_opt = wrap annotation_opt
+    let generic = wrap generic
   end
 
   module Declaration = struct
@@ -912,7 +920,7 @@ end = struct
       ) in
       let typeParameters = Type.type_parameter_declaration env in
       let params, defaults, rest = function_params env in
-      let returnType = Type.return_type env in
+      let returnType = Type.annotation_opt env in
       let _, body, strict = function_body env ~async ~generator in
       let simple = is_simple_function_params params defaults rest in
       strict_post_check env ~strict ~simple id params;
@@ -1522,7 +1530,7 @@ end = struct
           id, Type.type_parameter_declaration env
         end in
       let params, defaults, rest = Declaration.function_params env in
-      let returnType = Type.return_type env in
+      let returnType = Type.annotation_opt env in
       let end_loc, body, strict =
         Declaration.function_body env ~async ~generator in
       let simple = Declaration.is_simple_function_params params defaults rest in
@@ -1766,7 +1774,7 @@ end = struct
             [param], [], None, None
           else
             let params, defaults, rest = Declaration.function_params env in
-            params, defaults, rest, Type.return_type env in
+            params, defaults, rest, Type.annotation_opt env in
 
         (* It's hard to tell if an invalid expression was intended to be an
          * arrow function before we see the =>. If there are no params, that
@@ -1939,7 +1947,12 @@ end = struct
       let async = false in
       let generator = Declaration.generator env async in
       let _, key = key env in
-      let typeParameters = Type.type_parameter_declaration env in
+      (* It's not clear how type params on getters & setters would make sense
+       * in Flow's type system. Since this is a Flow syntax extension, we might
+       * as well disallow it until we need it *)
+      let typeParameters = Ast.Expression.Object.Property.(match kind with
+      | Get | Set -> None
+      | _ -> Type.type_parameter_declaration env) in
       Expect.token env T_LPAREN;
       let params = Ast.Expression.Object.Property.(match kind with
       | Get -> []
@@ -1949,7 +1962,7 @@ end = struct
         [ (fst param, Pattern.Identifier param) ]
       | Init -> assert false) in
       Expect.token env T_RPAREN;
-      let returnType = Type.return_type env in
+      let returnType = Type.annotation_opt env in
       let _, body, strict = Declaration.function_body env ~async ~generator in
       let defaults = [] in
       let rest = None in
@@ -1993,12 +2006,14 @@ end = struct
               "get"; _}) as key)) ->
               (match Peek.token env with
               | T_COLON
+              | T_LESS_THAN
               | T_LPAREN -> init env start_loc key false false
               | _ -> get env start_loc)
           | false, false, (_, (Property.Identifier (_, { Ast.Identifier.name =
               "set"; _}) as key)) ->
               (match Peek.token env with
               | T_COLON
+              | T_LESS_THAN
               | T_LPAREN -> init env start_loc key false false
               | _ -> set env start_loc)
           | async, generator, (_, key) ->
@@ -2045,7 +2060,7 @@ end = struct
             | T_LPAREN ->
                 let typeParameters = Type.type_parameter_declaration env in
                 let params, defaults, rest = Declaration.function_params env in
-                let returnType = Type.return_type env in
+                let returnType = Type.annotation_opt env in
                 let _, body, strict =
                   Declaration.function_body env ~async ~generator in
                 let simple = Declaration.is_simple_function_params params defaults rest in
@@ -2201,7 +2216,7 @@ end = struct
         Ast.Class.(Body.Method (Loc.btwn start_loc end_loc, Method.({
           key;
           value;
-          kind = Ast.Expression.Object.Property.Get;
+          kind = Get;
           static;
         })))
 
@@ -2211,27 +2226,34 @@ end = struct
         Ast.Class.(Body.Method (Loc.btwn start_loc end_loc, Method.({
           key;
           value;
-          kind = Ast.Expression.Object.Property.Set;
+          kind = Set;
           static;
         })))
 
       in let init env start_loc key async generator static =
-        if not async && not generator && Peek.token env = T_COLON
-        then begin
+        match Peek.token env with
+        | T_COLON
+        | T_ASSIGN
+        | T_SEMICOLON when not async && not generator ->
           (* Class property with annotation *)
-          let typeAnnotation = Type.annotation env in
+          let typeAnnotation = Type.annotation_opt env in
+          let value =
+            if Expect.maybe env T_ASSIGN
+            then Some (Parse.expression env)
+            else None in
           let end_loc = Peek.loc env in
           Expect.token env T_SEMICOLON;
           let loc = Loc.btwn start_loc end_loc in
           Ast.Class.(Body.Property (loc, Property.({
             key;
+            value;
             typeAnnotation;
             static;
           })))
-        end else begin
+        | _ ->
           let typeParameters = Type.type_parameter_declaration env in
           let params, defaults, rest = Declaration.function_params env in
-          let returnType = Type.return_type env in
+          let returnType = Type.annotation_opt env in
           let _, body, strict =
             Declaration.function_body env ~async ~generator in
           let simple =
@@ -2253,13 +2275,24 @@ end = struct
             returnType;
             typeParameters;
           }) in
+          let kind = Ast.(match key with
+            | Expression.Object.Property.Identifier (_, {
+                Identifier.name = "constructor";
+                _;
+              })
+            | Expression.Object.Property.Literal (_, {
+                Literal.value = Literal.String "constructor";
+                _;
+              }) ->
+              Class.Method.Constructor
+            | _ ->
+              Class.Method.Method) in
           Ast.Class.(Body.Method (Loc.btwn start_loc end_loc, Method.({
             key;
             value;
-            kind = Ast.Expression.Object.Property.Init;
+            kind;
             static;
           })))
-      end
 
       in fun env -> Ast.Expression.Object.Property.(
         let start_loc = Peek.loc env in
@@ -2270,11 +2303,19 @@ end = struct
         | false, false,
           (_, (Identifier (_, { Identifier.name = "get"; _ }) as key)) ->
             (match Peek.token env with
+            | T_LESS_THAN
+            | T_COLON
+            | T_ASSIGN
+            | T_SEMICOLON
             | T_LPAREN -> init env start_loc key async generator static
             | _ -> get env start_loc static )
         | false, false,
           (_, (Identifier (_, { Identifier.name = "set"; _ }) as key)) ->
             (match Peek.token env with
+            | T_LESS_THAN
+            | T_COLON
+            | T_ASSIGN
+            | T_SEMICOLON
             | T_LPAREN -> init env start_loc key async generator static
             | _ -> set env start_loc static)
         | _, _, (_, key) ->
@@ -2801,15 +2842,7 @@ end = struct
        which are subsumed by `type` and `declare class` *)
     and interface =
       let rec extends env acc =
-        let id = Parse.identifier env in
-        let typeParameters = Type.type_parameter_instantiation env in
-        let loc = match typeParameters with
-        | None -> fst id
-        | Some (loc, _) -> Loc.btwn (fst id) loc in
-        let extend = loc, Statement.Interface.Extends.({
-          id;
-          typeParameters;
-        }) in
+        let extend = Type.generic env in
         let acc = extend::acc in
         match Peek.token env with
         | T_COMMA ->
@@ -2845,15 +2878,7 @@ end = struct
       (* This is identical to `interface` *)
       let declare_class =
         let rec extends env acc =
-          let id = Parse.identifier env in
-          let typeParameters = Type.type_parameter_instantiation env in
-          let loc = match typeParameters with
-          | None -> fst id
-          | Some (loc, _) -> Loc.btwn (fst id) loc in
-          let extend = loc, Statement.Interface.Extends.({
-            id;
-            typeParameters;
-          }) in
+          let extend = Type.generic env in
           let acc = extend::acc in
           match Peek.token env with
           | T_COMMA ->

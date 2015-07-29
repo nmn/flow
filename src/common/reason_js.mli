@@ -40,6 +40,7 @@ val is_derivable_reason: reason -> bool
 
 (* used in builtins *)
 val builtin_reason: string -> reason
+val is_builtin_reason: reason -> bool
 
 val string_of_reason: reason -> string
 val json_of_reason: reason -> Hh_json.json
@@ -68,4 +69,5 @@ val do_patch: string list -> (int * int * string) list -> string
 
 val same_scope: reason -> reason -> bool
 
-val strip_root: reason -> Path.t -> reason
+val strip_root: Path.t -> reason -> reason
+val strip_root_from_loc: Path.t -> Loc.t -> Loc.t
