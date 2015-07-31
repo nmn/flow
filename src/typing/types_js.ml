@@ -47,7 +47,7 @@ let init_modes opts = Options.(
   modes.munge_underscores <- opts.opt_munge_underscores;
   (* TODO: confirm that only master uses strip_root, otherwise set it! *)
   Module_js.init opts;
-  Files_js.init opts.opt_libs
+  Files_js.init ~tmp_dir:(Options.temp_dir opts) opts.opt_libs
 )
 
 (****************** shared context heap *********************)
@@ -165,7 +165,7 @@ let filter_suppressed_errors = Errors_js.(
 
 let strip_root_from_reason_list root list =
   List.map (
-    fun (reason, s) -> (Reason_js.strip_root reason root, s)
+    fun (reason, s) -> (Reason_js.strip_root root reason, s)
   ) list
 
 let strip_root_from_error root error =

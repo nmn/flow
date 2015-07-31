@@ -10,9 +10,10 @@
 type moduleSystem = Node | Haste
 
 type options = {
-  munge_underscores: bool;
+  enable_unsafe_getters_and_setters: bool;
   moduleSystem: moduleSystem;
   module_name_mappers: (Str.regexp * string) list;
+  munge_underscores: bool;
   suppress_comments: Str.regexp list;
   suppress_types: Utils.SSet.t;
   traces: int;
@@ -20,6 +21,7 @@ type options = {
   log_file: Path.t;
 }
 
+val default_temp_dir: string
 val default_module_system: moduleSystem
 val default_options: Path.t -> options
 
@@ -44,6 +46,11 @@ type config = {
 val get: Path.t -> config
 val get_unsafe: unit -> config
 val fullpath: Path.t -> string
+
+val init_file: tmp_dir:string -> Path.t -> string
+val lock_file: tmp_dir:string -> Path.t -> string
+val pids_file: tmp_dir:string -> Path.t -> string
+val socket_file: tmp_dir:string -> Path.t -> string
 
 val init: Path.t -> string list -> unit
 

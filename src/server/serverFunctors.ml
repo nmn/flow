@@ -48,27 +48,28 @@ end = struct
     Hh_logger.log "Error: another server is already running?\n";
     exit 1
 
-  let grab_lock root =
-    if not (Lock.grab (Lock.name root "lock"))
+  let grab_lock ~tmp_dir root =
+    if not (Lock.grab (FlowConfig.lock_file ~tmp_dir root))
     then other_server_running()
 
-  let grab_init_lock root =
-    ignore(Lock.grab (Lock.name root "init"))
+  let grab_init_lock ~tmp_dir root =
+    ignore(Lock.grab (FlowConfig.init_file ~tmp_dir root))
 
-  let release_init_lock root =
-    ignore(Lock.release (Lock.name root "init"))
+  let release_init_lock ~tmp_dir root =
+    ignore(Lock.release (FlowConfig.init_file ~tmp_dir root))
 
   (* This code is only executed when the options --check is NOT present *)
   let go options init_fun =
     let root = Options.root options in
+    let tmp_dir = Options.temp_dir options in
     let t = Unix.gettimeofday () in
-    grab_lock root;
+    grab_lock ~tmp_dir root;
     Hh_logger.log "Initializing Server (This might take some time)";
-    grab_init_lock root;
+    grab_init_lock ~tmp_dir root;
     (* note: we only run periodical tasks on the root, not extras *)
     ServerPeriodical.init root;
     let env = init_fun () in
-    release_init_lock root;
+    release_init_lock ~tmp_dir root;
     Hh_logger.log "Server is READY";
     let t' = Unix.gettimeofday () in
     Hh_logger.log "Took %f seconds to initialize." (t' -. t);
@@ -160,24 +161,23 @@ end = struct
 
   let serve genv env socket =
     let root = Options.root genv.options in
+    let tmp_dir = Options.temp_dir genv.options in
     let env = ref env in
     while true do
-      if not (Lock.check (Lock.name root "lock")) then begin
+      let lock_file = FlowConfig.lock_file ~tmp_dir root in
+      if not (Lock.check lock_file) then begin
         Hh_logger.log "Lost %s lock; reacquiring.\n" Program.name;
-        FlowEventLogger.lock_lost root "lock";
-        if not (Lock.grab (Lock.name root "lock"))
+        FlowEventLogger.lock_lost lock_file;
+        if not (Lock.grab lock_file)
         then
           Hh_logger.log "Failed to reacquire lock; terminating.\n";
-          FlowEventLogger.lock_stolen root "lock";
+          FlowEventLogger.lock_stolen lock_file;
           die()
       end;
       ServerPeriodical.call_before_sleeping();
       let has_client = sleep_and_check socket in
-      let start_t = Unix.time () in
       let loop_count, rechecked_count, new_env = recheck_loop genv !env in
       env := new_env;
-      if rechecked_count > 0
-      then FlowEventLogger.recheck_end start_t loop_count rechecked_count;
       if has_client then handle_connection genv !env socket;
       ServerEnv.invoke_async_queue ();
       EventLogger.flush ();
@@ -185,7 +185,7 @@ end = struct
 
   let create_program_init genv env = fun () ->
     let env = Program.init genv env in
-    FlowEventLogger.init_done "fresh";
+    FlowEventLogger.init_done ();
     env
 
   (* The main entry point of the daemon
@@ -196,14 +196,15 @@ end = struct
   *)
   let main options =
     let root = Options.root options in
-    FlowEventLogger.init root (Unix.time ());
+    let tmp_dir = Options.temp_dir options in
+    FlowEventLogger.init_server root;
     Program.preinit ();
     SharedMem.(init default_config);
     (* this is to transform SIGPIPE in an exception. A SIGPIPE can happen when
     * someone C-c the client.
     *)
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-    PidLog.init root;
+    PidLog.init (FlowConfig.pids_file ~tmp_dir root);
     PidLog.log ~reason:"main" (Unix.getpid());
     let watch_paths = root :: Program.get_watch_paths options in
     let genv =
@@ -216,7 +217,7 @@ end = struct
       Program.run_once_and_exit genv env
     else
       let env = MainInit.go options program_init in
-      let socket = Socket.init_unix_socket root in
+      let socket = Socket.init_unix_socket (FlowConfig.socket_file ~tmp_dir root) in
       serve genv env socket
 
   let daemonize options =
