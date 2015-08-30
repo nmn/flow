@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Utils
 
 (*****************************************************************************)
@@ -28,7 +29,7 @@ exception Format_error
 
 let debug () fnl =
   let modes = [Some FileInfo.Mstrict; Some FileInfo.Mpartial] in
-  List.fold_left begin fun () (filepath : Path.t) ->
+  List.iter fnl begin fun (filepath : Path.t) ->
     try
       let content = Sys_utils.cat (filepath :> string) in
 
@@ -74,11 +75,8 @@ let debug () fnl =
         Printf.eprintf
           "Applying the formatter twice lead to different results: %s\n%!"
           (filepath :> string);
-        let () = Random.self_init() in
-        let nbr = string_of_int (Random.int 100000) in
-        let tmp = "/tmp/xx_"^nbr in
-        let file1 = tmp^"_1.php" in
-        let file2 = tmp^"_2.php" in
+        let file1 = Filename.temp_file "xx_" "_1.php" in
+        let file2 = Filename.temp_file "xx_" "_2.php" in
         let oc = open_out file1 in
         output_string oc content;
         close_out oc;
@@ -108,12 +106,12 @@ let debug () fnl =
         Printf.eprintf "Format error: %s\n%!" (filepath :> string);
     | Exit ->
         ()
-  end () fnl
+  end
 
 let debug_directory dir =
   let path = Path.make dir in
   let next = compose
-    (rev_rev_map Path.make)
+    (List.map ~f:Path.make)
     (Find.make_next_files FindUtils.is_php path) in
   let workers = Worker.make GlobalConfig.nbr_procs GlobalConfig.gc_control in
   MultiWorker.call
@@ -195,9 +193,9 @@ let format_in_place modes (filepath : Path.t) =
       close_out oc;
       None
   | Format_hack.Internal_error ->
-      Some "Internal error\n"
+      Some (Printf.sprintf "Internal error in %s\n" (Path.to_string filepath))
   | Format_hack.Parsing_error errorl ->
-      Some (Errors.to_string (Errors.to_absolute (List.hd errorl)))
+      Some (Errors.to_string (Errors.to_absolute (List.hd_exn errorl)))
   | Format_hack.Disabled_mode ->
       None
 
@@ -206,16 +204,16 @@ let format_in_place modes (filepath : Path.t) =
 (*****************************************************************************)
 
 let job_in_place modes acc fnl =
-  List.fold_left begin fun acc filename ->
+  List.fold_left fnl ~f:begin fun acc filename ->
     match format_in_place modes filename with
     | None -> acc
     | Some err -> err :: acc
-  end acc fnl
+  end ~init:acc
 
 let directory modes dir =
   let path = Path.make dir in
   let next = compose
-    (rev_rev_map Path.make)
+    (List.map ~f:Path.make)
     (Find.make_next_files FindUtils.is_php path) in
   let workers = Worker.make GlobalConfig.nbr_procs GlobalConfig.gc_control in
   let messages =
@@ -226,7 +224,7 @@ let directory modes dir =
       ~merge:List.rev_append
       ~next
   in
-  List.iter (Printf.fprintf stderr "%s\n") messages
+  List.iter messages (Printf.eprintf "%s\n")
 
 (*****************************************************************************)
 (* Applies the formatter directly to a string. *)
@@ -237,11 +235,12 @@ let format_string modes file from to_ content =
   | Format_hack.Success content ->
       output_string stdout content
   | Format_hack.Internal_error ->
-      Printf.fprintf stderr "Internal error\n%!";
+      Printf.eprintf "Internal error in %s\n%!"
+        (Path.to_string file);
       exit 2
   | Format_hack.Parsing_error error ->
-      Printf.fprintf stderr "Parsing error\n%s\n%!"
-        (Errors.to_string (Errors.to_absolute (List.hd error)));
+      Printf.eprintf "Parsing error\n%s\n%!"
+        (Errors.to_string (Errors.to_absolute (List.hd_exn error)));
       exit 2
   | Format_hack.Disabled_mode ->
       exit 0
@@ -290,10 +289,10 @@ let () =
       let file_and_modified_lines = Format_diff.parse_diff prefix diff in
       Format_diff.apply modes apply_mode ~diff:file_and_modified_lines
   | _ when diff ->
-      Printf.fprintf stderr "--diff mode expects no files\n";
+      Printf.eprintf "--diff mode expects no files\n";
       exit 2
   | [] when apply_mode <> Format_mode.Print ->
-      Printf.fprintf stderr "Cannot modify stdin in-place\n";
+      Printf.eprintf "Cannot modify stdin in-place\n";
       exit 2
   | [] -> format_stdin modes from to_
   | [dir] when Sys.is_directory dir ->

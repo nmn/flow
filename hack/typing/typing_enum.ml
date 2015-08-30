@@ -14,9 +14,10 @@
  * have the proper type, and restricts what types can be used for enums.
  *)
 (*****************************************************************************)
+open Core
 open Nast
-open Utils
 open Typing_defs
+open Utils
 
 module SN = Naming_special_names
 module Phase = Typing_phase
@@ -70,9 +71,9 @@ let member_type env member_ce =
 let check_valid_array_key_type f_fail ~allow_any:allow_any env p t =
   let ety_env = Phase.env_with_self env in
   let env, (r, t'), trail =
-    Typing_tdef.force_expand_typedef ~phase:Phase.locl ~ety_env env t in
+    Typing_tdef.force_expand_typedef ~ety_env env t in
   (match t' with
-    | Tprim (Tint | Tstring | Tclassname _) -> ()
+    | Tprim (Tint | Tstring) -> ()
     (* Enums have to be valid array keys *)
     | Tabstract (AKenum _, _) -> ()
     | Tany when allow_any -> ()
@@ -104,10 +105,9 @@ let enum_class_check env tc consts const_types =
   match is_enum (tc.tc_pos, tc.tc_name) tc.tc_enum_type tc.tc_ancestors with
     | Some (ty_exp, _, ty_constraint) ->
         let ety_env = Phase.env_with_self env in
-        let phase = Phase.decl in
-        let env, (r, ty_exp'), trail =
-          Typing_tdef.force_expand_typedef ~phase ~ety_env env ty_exp in
         let env, ty_exp = Phase.localize ~ety_env env ty_exp in
+        let env, (r, ty_exp'), trail =
+          Typing_tdef.force_expand_typedef ~ety_env env ty_exp in
         (match ty_exp' with
           (* We disallow first-class enums from being non-exact types, because
            * a switch on such an enum can lead to very unexpected results,
@@ -136,10 +136,10 @@ let enum_class_check env tc consts const_types =
         let env = (match ty_constraint with
           | Some ty ->
              let env, ty = Phase.localize ~ety_env env ty in
-            Typing_ops.sub_type tc.tc_pos Reason.URenum_cstr env ty ty_exp
+             Typing_ops.sub_type tc.tc_pos Reason.URenum_cstr env ty ty_exp
           | None -> env) in
 
-        List.fold_left2 (enum_check_const ty_exp) env consts const_types
+        List.fold2_exn ~f:(enum_check_const ty_exp) ~init:env consts const_types
 
     | None -> env
 
@@ -176,14 +176,14 @@ let get_constant tc (seen, has_default) = function
 
 let check_enum_exhaustiveness pos tc caselist =
   let (seen, has_default) =
-    List.fold_left (get_constant tc) (SMap.empty, false) caselist in
+    List.fold_left ~f:(get_constant tc) ~init:(SMap.empty, false) caselist in
   let consts = SMap.remove SN.Members.mClass tc.tc_consts in
   let all_cases_handled = SMap.cardinal seen = SMap.cardinal consts in
   match (all_cases_handled, has_default) with
     | false, false ->
       let const_list = SMap.keys consts in
       let unhandled =
-        List.filter (function k -> not (SMap.mem k seen)) const_list in
+        List.filter const_list (function k -> not (SMap.mem k seen)) in
       Errors.enum_switch_nonexhaustive pos unhandled tc.tc_pos
     | true, true -> Errors.enum_switch_redundant_default pos tc.tc_pos
     | _ -> ()

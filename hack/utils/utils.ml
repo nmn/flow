@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -7,6 +7,8 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  *
  *)
+
+open Core
 
 let () = Random.self_init ()
 let debug = ref false
@@ -147,10 +149,6 @@ let opt f env = function
   | None -> env, None
   | Some x -> let env, x = f env x in env, Some x
 
-let opt_map f = function
-  | None -> None
-  | Some x -> Some (f x)
-
 let opt_fold f env = function
   | None -> env
   | Some x -> f env x
@@ -185,12 +183,12 @@ let imap_union m1 m2 = IMap.fold IMap.add m1 m2
 let smap_inter_list = function
   | [] -> SMap.empty
   | x :: rl ->
-      List.fold_left smap_inter x rl
+      List.fold_left rl ~f:smap_inter ~init:x
 
 let imap_inter_list = function
   | [] -> IMap.empty
   | x :: rl ->
-      List.fold_left imap_inter x rl
+      List.fold_left rl ~f:imap_inter ~init:x
 
 (* This is a significant misnomer... you may want fold_left_env instead. *)
 let lfold = lmap
@@ -241,7 +239,7 @@ let safe_ios p s =
   with _ -> None
 
 let sl l =
-  List.fold_right (^) l ""
+  List.fold_right l ~f:(^) ~init:""
 
 let soi = string_of_int
 
@@ -257,25 +255,18 @@ let unsafe_opt_note note = function
 
 let unsafe_opt x = unsafe_opt_note "unsafe_opt got None" x
 
-let liter f env l = List.iter (f env) l
+let liter f env l = List.iter l (f env)
 
 let inter_list = function
   | [] -> SSet.empty
   | x :: rl ->
-      List.fold_left SSet.inter x rl
+      List.fold_left rl ~f:SSet.inter ~init:x
 
 let rec list_last f1 f2 =
   function
     | [] -> ()
     | [x] -> f2 x
     | x :: rl -> f1 x; list_last f1 f2 rl
-
-let rec uniq = function
-  | [] -> []
-  | [x] -> [x]
-  | x :: (y :: _ as l) when x = y -> uniq l
-  | x :: rl -> x :: uniq rl
-
 
 let is_prefix_dir dir fn =
   let prefix = dir ^ Filename.dir_sep in
@@ -303,8 +294,11 @@ let iter_n_acc n f acc =
   done;
   !acc
 
-let set_of_list list =
-  List.fold_right SSet.add list SSet.empty
+let map_of_list list =
+  List.fold_left ~f:(fun m (k, v) -> SMap.add k v m) ~init:SMap.empty list
+
+let set_of_list l =
+  List.fold_right l ~f:SSet.add ~init:SSet.empty
 
 (* \A\B\C -> A\B\C *)
 let strip_ns s =
@@ -357,12 +351,8 @@ let rec iter2_shortest f l1 l2 =
   | [], _ | _, [] -> ()
   | x1 :: rl1, x2 :: rl2 -> f x1 x2; iter2_shortest f rl1 rl2
 
-(* We may want to replace this with a tail-recursive map at some point,
- * factoring here so we have a clean way to grep. *)
-let rev_rev_map f l = List.rev (List.rev_map f l)
-
 let fold_fun_list acc fl =
-  List.fold_left (|>) acc fl
+  List.fold_left fl ~f:(|>) ~init:acc
 
 let compose f g x = f (g x)
 
@@ -373,3 +363,13 @@ let with_context ~enter ~exit ~do_ =
     raise e in
   exit ();
   result
+
+(* We run with exception backtraces turned off for performance reasons. But for
+ * some kinds of catastrophic exceptions, which we never recover from (so the
+ * performance doesn't matter) we do want the backtrace. "assert false" is one
+ * of such conditions.
+ *)
+let assert_false_log_backtrace () =
+  Printf.eprintf "%s" (Printexc.raw_backtrace_to_string
+    (Printexc.get_callstack 100));
+  assert false

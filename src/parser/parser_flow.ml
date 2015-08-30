@@ -17,16 +17,11 @@ module SSet = Set.Make(String)
 module SMap = Map.Make(String)
 
 let is_future_reserved = function
-  | "class"
-  | "enum"
-  | "export"
-  | "extends"
-  | "interface"
-  | "import"
-  | "super" -> true
+  | "enum" -> true
   | _ -> false
 
 let is_strict_reserved = function
+  | "interface"
   | "implements"
   | "package"
   | "private"
@@ -73,7 +68,10 @@ module Peek = struct
   let identifier ?(i=0) env =
     let name = value ~i env in
     match token ~i env with
-    | _ when is_strict_reserved name || is_restricted name -> true
+    | _ when
+      is_strict_reserved name ||
+      is_restricted name ||
+      is_future_reserved name-> true
     | T_LET
     | T_TYPE
     | T_OF
@@ -1054,12 +1052,12 @@ end = struct
 
       in let error_callback _ _ = raise Try.Rollback
 
-      (** So we may or may not be parsing the first part of an arrow function
-        * (the part before the =>). We might end up parsing that whole thing or
-        * we might end up parsing only part of it and thinking we're done. We
-        * need to look at the next token to figure out if we really parsed an
-        * assignment expression or if this is just the beginning of an arrow
-        * function *)
+      (* So we may or may not be parsing the first part of an arrow function
+       * (the part before the =>). We might end up parsing that whole thing or
+       * we might end up parsing only part of it and thinking we're done. We
+       * need to look at the next token to figure out if we really parsed an
+       * assignment expression or if this is just the beginning of an arrow
+       * function *)
       in let try_assignment_but_not_arrow_function env =
         let env = env |> with_error_callback error_callback in
         let ret = assignment_but_not_arrow_function env in
@@ -3126,8 +3124,9 @@ end = struct
                 declaration;
                 specifiers = None;
                 source = None;
+                exportKind = ExportValue;
               }
-          | T_TYPE ->
+          | T_TYPE when (Peek.token env ~i:1) <> T_LCURLY ->
               (* export type ... *)
               let type_alias = type_alias env in
               let end_loc = fst type_alias in
@@ -3136,6 +3135,7 @@ end = struct
                 declaration = Some (Declaration type_alias);
                 specifiers = None;
                 source = None;
+                exportKind = ExportType;
               }
           | T_LET
           | T_CONST
@@ -3152,6 +3152,7 @@ end = struct
                 declaration;
                 specifiers = None;
                 source = None;
+                exportKind = ExportValue;
               }
           | T_MULT ->
               let loc = Peek.loc env in
@@ -3168,8 +3169,14 @@ end = struct
                 declaration = None;
                 specifiers;
                 source;
+                exportKind = ExportValue;
               }
           | _ ->
+              let exportKind = (
+                match Peek.token env with
+                | T_TYPE -> Eat.token env; ExportType
+                | _ -> ExportValue
+              ) in
               Expect.token env T_LCURLY;
               let specifiers = Some (ExportSpecifiers (specifiers env [])) in
               let end_loc = Peek.loc env in
@@ -3189,6 +3196,7 @@ end = struct
                 declaration = None;
                 specifiers;
                 source;
+                exportKind;
               }
           )
 
@@ -3884,19 +3892,19 @@ end
 (*****************************************************************************)
 (* Entry points *)
 (*****************************************************************************)
-let parse_program fail filename content =
+let parse_program fail ?(token_sink=None) filename content =
   let lb = Lexing.from_string content in
   (match filename with None -> () | Some fn ->
     lb.Lexing.lex_curr_p <-
       { lb.Lexing.lex_curr_p with Lexing.pos_fname = fn });
-  let env = init_env lb in
+  let env = init_env ~token_sink lb in
   let ast = Parse.program env in
   if fail && (errors env) <> []
   then raise (Error.Error (filter_duplicate_errors [] (errors env)));
   ast, List.rev (errors env)
 
-let program ?(fail=true) content =
-  parse_program fail None content
+let program ?(fail=true) ?(token_sink=None) content =
+  parse_program fail ~token_sink None content
 
-let program_file ?(fail=true) content filename =
-  parse_program fail (Some filename) content
+let program_file ?(fail=true) ?(token_sink=None) content filename =
+  parse_program fail ~token_sink (Some filename) content

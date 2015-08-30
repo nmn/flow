@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Nast
 
 type eval_error =
@@ -20,56 +21,12 @@ type eval_error =
 exception Not_static_exn of Pos.t
 exception Type_error_exn
 
-let unescape_string unescaper s =
-  let buf = Buffer.create (String.length s) in
-  let i = ref 0 in
-  while !i < String.length s do
-    begin match s.[!i] with
-    | '\\' ->
-        i := !i + 1;
-        unescaper s i buf
-    | c ->
-        Buffer.add_char buf c
-    end;
-    i := !i + 1
-  done;
-  Buffer.contents buf
-
-(* For single-quoted strings, slashes and single quotes need to be escaped, and
- * all other characters are treated literally -- i.e. '\n' is the literal
- * slash + 'n' *)
-let single_quote_unescaper s i buf =
-  match s.[!i] with
-  | '\\'
-  | '\'' as c -> Buffer.add_char buf c
-  | c ->
-      Buffer.add_char buf '\\';
-      Buffer.add_char buf c
-
-let double_quote_unescaper s i buf =
-  match s.[!i] with
-  | '\\'
-  | '\'' as c -> Buffer.add_char buf c
-  | 'n' -> Buffer.add_char buf '\n'
-  | 'r' -> Buffer.add_char buf '\r'
-  | 't' -> Buffer.add_char buf '\t'
-  | 'v' -> Buffer.add_char buf '\x0b'
-  | 'e' -> Buffer.add_char buf '\x1b'
-  | 'f' -> Buffer.add_char buf '\x0c'
-  | '$' -> Buffer.add_char buf '$'
-  (* should also handle octal / hex escape sequences but I'm lazy *)
-  | c ->
-      Buffer.add_char buf '\\';
-      Buffer.add_char buf c
-
 let rec static_string_exn ~allow_consts cclass = function
   | _, Binop (Ast.Dot, s1, s2) ->
       let p1, s1 = static_string_exn ~allow_consts cclass s1 in
       let _p2, s2 = static_string_exn ~allow_consts cclass s2 in
       p1, s1 ^ s2
-  | _, String (p, s) -> p, unescape_string single_quote_unescaper s
-  (* This matches double-quoted strings w/o interpolated variables *)
-  | p, String2 ([], s) -> p, unescape_string double_quote_unescaper s
+  | _, String (p, s) -> p, s
   | p, Class_const (CIself, (_, s)) when allow_consts -> begin
       match cclass with
       | None -> raise Type_error_exn
@@ -86,14 +43,14 @@ let rec static_string_exn ~allow_consts cclass = function
   | p, _ -> raise (Not_static_exn p)
 
 and get_const s cclass class_ =
-    let (_, (p, _), cst_expr_opt) =
-      try
-        List.find (fun (_, (_, id), _) -> id = s) class_.c_consts
-      with Not_found ->
-        raise Type_error_exn in
-    match cst_expr_opt with
-    | Some cst_expr -> static_string_exn ~allow_consts:true cclass cst_expr
-    | None -> raise (Not_static_exn p)
+  let (_, (p, _), cst_expr_opt) =
+    try
+      List.find_exn class_.c_consts ~f:(fun (_, (_, id), _) -> id = s)
+    with Not_found ->
+      raise Type_error_exn in
+  match cst_expr_opt with
+  | Some cst_expr -> static_string_exn ~allow_consts:true cclass cst_expr
+  | None -> raise (Not_static_exn p)
 
 let static_string ~allow_consts cclass expr =
   try Result.Ok (static_string_exn ~allow_consts cclass expr) with

@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Utils
 
 module C = Tty
@@ -38,19 +39,19 @@ let print_reason_color ~(first:bool) ~(code:int) ((p, s): Pos.absolute * string)
   if not first then Printf.printf "  " else ();
   if Unix.isatty Unix.stdout
   then
-    let cwd = Sys.getcwd () ^ "/" in
+    let cwd = Filename.concat (Sys.getcwd ()) "" in
     let file_path = [
-      (file_clr, lstrip p.Pos.pos_file cwd);
+      (file_clr, lstrip (Pos.filename p) cwd);
       (C.Normal C.Default, ":");
     ] in
     C.print (file_path @ to_print)
   else
-    let strings = List.map (fun (_,x) -> x) to_print in
-    Printf.printf "%s:" p.Pos.pos_file;
-    List.iter (Printf.printf "%s") strings
+    let strings = List.map to_print (fun (_,x) -> x) in
+    Printf.printf "%s:" (Pos.filename p);
+    List.iter strings (Printf.printf "%s")
 
 let print_error_color e =
   let code = Errors.get_code e in
   let msg_list = Errors.to_list e in
-  print_reason_color ~first:true ~code (List.hd msg_list);
-  List.iter (print_reason_color ~first:false ~code) (List.tl msg_list)
+  print_reason_color ~first:true ~code (List.hd_exn msg_list);
+  List.iter (List.tl_exn msg_list) (print_reason_color ~first:false ~code)

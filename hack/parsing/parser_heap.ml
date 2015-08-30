@@ -8,6 +8,8 @@
  *
  *)
 
+open Core
+
 (*****************************************************************************)
 (* Table containing all the HH_FIXMEs found in the source code.
  * Associates: filename => line_number, error_node_number map
@@ -31,8 +33,8 @@ end)
 
 let () =
   Errors.is_hh_fixme := begin fun pos err_code ->
-    let filename = pos.Pos.pos_file in
-    let line = pos.Pos.pos_start.Lexing.pos_lnum in
+    let filename = Pos.filename pos in
+    let line, _, _ = Pos.info_pos pos in
     match HH_FIXMES.get filename with
     | None -> false
     | Some fixme_map ->
@@ -55,8 +57,8 @@ let find_class_in_file file_name class_name =
   match ParserHeap.get file_name with
   | None -> None
   | Some defs ->
-      List.fold_left begin fun acc def ->
+      List.fold_left defs ~init:None ~f:begin fun acc def ->
         match def with
         | Ast.Class c when snd c.Ast.c_name = class_name -> Some c
         | _ -> acc
-      end None defs
+      end

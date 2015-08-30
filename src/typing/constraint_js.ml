@@ -217,8 +217,8 @@ module Type = struct
   (* operations on runtime values, such as functions, objects, and arrays *)
   | CallT of reason * funtype
   | MethodT of reason * name * funtype
-  | SetT of reason * name * t
-  | GetT of reason * name * t
+  | SetT of reason * proptype * t
+  | GetT of reason * proptype * t
   | SetElemT of reason * t * t
   | GetElemT of reason * t * t
 
@@ -241,6 +241,7 @@ module Type = struct
   (* logical operators *)
   | AndT of reason * t * t
   | OrT of reason * t * t
+  | NotT of reason * t
 
   (* operation on polymorphic types *)
   (** SpecializeT(_, cache, targs, tresult) instantiates a polymorphic type with
@@ -339,9 +340,15 @@ module Type = struct
     proto_t: prototype;
   }
 
+  and proptype = reason * name
+
+  and sealtype =
+    | UnsealedInFile of string option
+    | Sealed
+
   and flags = {
     frozen: bool;
-    sealed: bool;
+    sealed: sealtype;
     exact: bool;
   }
 
@@ -655,14 +662,133 @@ let copy_node node = match node with
 
 module Scope = struct
 
-  (* a scope entry is a symbol binding *)
-  (* TODO separate types, vars, consts... *)
-  type entry = {
-    specific: Type.t;
-    general: Type.t;
-    def_loc: Loc.t option;
-    for_type: bool;
-  }
+  (* entries for vars/lets, consts and types *)
+  module Entry = struct
+
+    type state = Undeclared | Declared | Initialized
+
+    let string_of_state = function
+    | Undeclared -> "Undeclared"
+    | Declared -> "Declared"
+    | Initialized -> "Initialized"
+
+    type value_kind = Const | Let | Var
+
+    let string_of_value_kind = function
+    | Const -> "const" | Let -> "let" | Var -> "var"
+
+    type value_binding = {
+      kind: value_kind;
+      value_state: state;
+      value_loc: Loc.t option;
+      specific: Type.t;
+      general: Type.t;
+    }
+
+    type type_binding = {
+      type_state: state;
+      type_loc: Loc.t option;
+      _type: Type.t;
+    }
+
+    type t =
+    | Value of value_binding
+    | Type of type_binding
+
+    (* constructors *)
+    let new_value kind state specific general value_loc =
+      Value {
+        kind;
+        value_state = state;
+        value_loc;
+        specific;
+        general
+      }
+
+    let new_const ?loc ?(state=Undeclared) t = new_value Const state t t loc
+
+    let new_let ?loc ?(state=Undeclared) t = new_value Let state t t loc
+
+    let new_var ?loc ?(state=Undeclared) ?specific general =
+      let specific = match specific with Some t -> t | None -> general in
+      new_value Var state specific general loc
+
+    let new_type ?loc ?(state=Undeclared) _type =
+      Type {
+        type_state = state;
+        type_loc = loc;
+        _type
+      }
+
+    (* accessors *)
+    let loc = function
+    | Value v -> v.value_loc
+    | Type t -> t.type_loc
+
+    let declared_type = function
+    | Value v -> v.general
+    | Type t -> t._type
+
+    let actual_type = function
+    | Value v -> v.specific
+    | Type t -> t._type
+
+    let string_of_kind = function
+    | Value v -> string_of_value_kind v.kind
+    | Type _ -> "type"
+
+    (* Given a name, an entry, and a function for making a new
+       specific type from a Var entry's current general type,
+       return a new non-internal Value entry with specific type replaced,
+       or the existing entry.
+       Note: we continue to need the is_internal trap here,
+       due to our modeling of this and super as flow-sensitive vars
+       in derived constructors.
+     *)
+    let havoc ?name make_specific name entry =
+      match entry with
+      | Value v ->
+        if is_internal_name name then entry
+        else Value { v with specific = make_specific v.general }
+      | Type _ -> entry
+
+  end
+
+  (* keys for refinements *)
+  module Key = struct
+
+    type proj = Prop of string | Elem of t
+    and t = string * proj list
+
+    let rec string_of_key (base, projs) =
+      base ^ String.concat "" (
+        (List.rev projs) |> List.map (function
+          | Prop name -> spf ".%s" name
+          | Elem expr -> spf "[%s]" (string_of_key expr)
+        ))
+
+    (* true if the given key uses the given property name *)
+    let rec uses_propname propname (base, proj) =
+      proj_uses_propname propname proj
+
+    (* true if the given projection list uses the given property name *)
+    and proj_uses_propname propname = function
+    | Prop name :: tail ->
+      name = propname || proj_uses_propname propname tail
+    | Elem key :: tail ->
+      uses_propname propname key || proj_uses_propname propname tail
+    | [] ->
+      false
+
+    let compare = Pervasives.compare
+
+  end
+
+  module KeySet : Set.S with type elt = Key.t
+  = Set.Make(Key)
+
+  module KeyMap : MapSig with type key = Key.t
+  = MyMap(Key)
 
   (* a var scope corresponds to a runtime activation,
      e.g. a function. *)
@@ -673,120 +799,97 @@ module Scope = struct
   (* var and lexical scopes differ in hoisting behavior
      and auxiliary properties *)
   (* TODO lexical scope support *)
-  type kind = VarScope of var_scope_attrs | LexScope
+  type kind =
+  | VarScope of var_scope_attrs
+  | LexScope
+
+  type refi_binding = {
+    refi_loc: Loc.t option;
+    refined: Type.t;
+    original: Type.t;
+  }
 
   (* a scope is a mutable binding table, plus kind and attributes *)
   (* TODO add in-scope type variable binding table *)
   type t = {
     kind: kind;
-    mutable entries: entry SMap.t;
+    mutable entries: Entry.t SMap.t;
+    mutable refis: refi_binding KeyMap.t
+  }
+
+  let fresh_impl kind = {
+    kind;
+    entries = SMap.empty;
+    refis = KeyMap.empty;
   }
 
   (* return a fresh scope of the most common kind (var, non-async) *)
-  let fresh () = {
-    kind = VarScope { async = false };
-    entries = SMap.empty;
-  }
+  let fresh () = fresh_impl (VarScope { async = false })
 
   (* return a fresh async var scope *)
-  let fresh_async () = {
-    kind = VarScope { async = true };
-    entries = SMap.empty;
-  }
+  let fresh_async () = fresh_impl (VarScope { async = true })
 
   (* return a fresh lexical scope *)
-  let fresh_lex () = {
-    kind = LexScope;
-    entries = SMap.empty;
-  }
+  let fresh_lex () = fresh_impl LexScope
 
   (* clone a scope (snapshots mutable entries) *)
-  let clone { kind; entries } =
-    { kind; entries }
+  let clone { kind; entries; refis } = { kind; entries; refis }
 
-  (* use passed f to update all scope entries *)
-  let update f scope =
-    scope.entries <- SMap.mapi f scope.entries
-
-  (* use passed f to update or remove scope entries *)
-  let update_opt f scope =
-    scope.entries <- SMap.fold (fun name entry acc ->
-      match f name entry with
-      | Some entry -> SMap.add name entry acc
-      | None -> acc
-    ) scope.entries SMap.empty
-
-  (* run passed f on all scope entries *)
-  let iter f scope =
+  (* use passed f to iterate over all scope entries *)
+  let iter_entries f scope =
     SMap.iter f scope.entries
 
+  (* use passed f to update all scope entries *)
+  let update_entries f scope =
+    scope.entries <- SMap.mapi f scope.entries
+
   (* add entry to scope *)
-  let add name entry scope =
+  let add_entry name entry scope =
     scope.entries <- SMap.add name entry scope.entries
 
   (* remove entry from scope *)
-  let remove name scope =
+  let remove_entry name scope =
     scope.entries <- SMap.remove name scope.entries
 
-  (* true iff name is bound in scope *)
-  let mem name scope =
-    SMap.mem name scope.entries
-
   (* get entry from scope, or None *)
-  let get name scope =
+  let get_entry name scope =
     SMap.get name scope.entries
 
-  (* get entry from scope, or fail *)
-  let get_unsafe name scope =
-    SMap.find_unsafe name scope.entries
+  (* use passed f to update all scope refis *)
+  let update_refis f scope =
+    scope.refis <- KeyMap.mapi f scope.refis
 
-  (* create new entry *)
-  let create_entry ?(for_type=false) specific general loc = {
-    specific;
-    general;
-    def_loc = loc;
-    for_type;
-  }
+  (* add refi to scope *)
+  let add_refi key refi scope =
+    scope.refis <- KeyMap.add key refi scope.refis
 
-  (* common logic for manipulating entries.
-     this is higher-level than the rest of this module, which
-     is essentially type-agnostic. it's here because it's
-     used by both Env and Flow, and Ocaml dep management ugh. *)
+  (* remove entry from scope *)
+  let remove_refi key scope =
+    scope.refis <- KeyMap.remove key scope.refis
 
-  (* refinement keys - soon to depart *)
+  (* get entry from scope, or None *)
+  let get_refi name scope =
+    KeyMap.get name scope.refis
 
-  let is_refinement name =
-    (String.length name) >= 5 && (String.sub name 0 5) = "$REFI"
+  (* helper: filter all refis whose expressions involve the given name *)
+  let filter_refis_using_propname propname refis =
+    refis |> KeyMap.filter (fun key _ ->
+      not (Key.uses_propname propname key)
+    )
 
-  (* Given a name, an entry, and a function for making a new
-     specific type from the entry's current general type,
-     return an entry with specific type replaced, subject to the
-     following conditions (which should only need to be understood here):
-
-     * refinements are always cleared outright.
-
-       Unlike real variables, a heap refinement pseudovar can simply be removed
-       on a havoc, since its "general type" resides in the underlying object
-       whose property is being refined. In the absence of a refinement entry,
-       lookups of such properties will resolve to GetT operations in the usual
-       way.
-
-       (Note: shortly, entries will become ADTs to reflect such structural
-       differences - heap refinements, among others, will lose their general
-       type fields entirely.)
-
-     * internal names (.this, .super, .return, .exports) are read-only,
-       and are never modified.
-
-     make_specific is optional. if not passed, non-internal var entries
-     are left untouched.
+  (* havoc a scope:
+     - if name is not passed, clear all refis. if passed, clear
+       any refis whose expressions involve name
+     - make_specific makes a new specific type from a general type.
+     if passed, havoc all non-internal var entries using it
    *)
-  let havoc_entry ?make_specific name entry =
-    if is_refinement name then None
-    else if is_internal_name name then Some entry
-    else match make_specific with
-    | None -> Some entry
-    | Some f -> Some { entry with specific = f entry.general }
+  let havoc ?name ?make_specific scope =
+    scope.refis <- (match name with
+    | Some name -> scope.refis |> (filter_refis_using_propname name)
+    | None -> KeyMap.empty);
+    match make_specific with
+    | Some f -> scope |> update_entries (Entry.havoc ~name f)
+    | None -> ()
 
 end
 
@@ -953,6 +1056,7 @@ let string_of_ctor = function
   | EqT _ -> "EqT"
   | AndT _ -> "AndT"
   | OrT _ -> "OrT"
+  | NotT _ -> "NotT"
   | SpecializeT _ -> "SpecializeT"
   | TypeAppT _ -> "TypeAppT"
   | MaybeT _ -> "MaybeT"
@@ -1045,6 +1149,7 @@ let rec reason_of_t = function
 
   | AndT (reason, _, _)
   | OrT (reason, _, _)
+  | NotT (reason, _)
 
   | TypeT (reason,_)
   | BecomeT (reason, _)
@@ -1232,6 +1337,7 @@ let rec mod_reason_of_t f = function
 
   | AndT (reason, t1, t2) -> AndT (f reason, t1, t2)
   | OrT (reason, t1, t2) -> OrT (f reason, t1, t2)
+  | NotT (reason, t) -> NotT (f reason, t)
 
   | SpecializeT(reason, cache, ts, t) -> SpecializeT (f reason, cache, ts, t)
 
@@ -1352,6 +1458,10 @@ let rec type_printer override fallback enclosure cx t =
     match t with
     | BoundT typeparam -> typeparam.name
 
+    | SingletonStrT (_, s) -> spf "'%s'" s
+    | SingletonNumT (_, (_, raw)) -> raw
+    | SingletonBoolT (_, b) -> string_of_bool b
+
     (* reasons for VoidT use "undefined" for more understandable error output.
        For parsable types we need to use "void" though, thus overwrite it. *)
     | VoidT _ -> "void"
@@ -1469,6 +1579,9 @@ let rec type_printer override fallback enclosure cx t =
         then type_s
         else "=" ^ type_s
 
+    | AnnotT (_, t) -> pp EnclosureNone cx t
+    | KeysT (_, t) -> spf "$Keys<%s>" (pp EnclosureNone cx t)
+
     (* The following types are not syntax-supported *)
     | ClassT t ->
         spf "[class: %s]" (pp EnclosureNone cx t)
@@ -1507,7 +1620,9 @@ let string_of_t_ =
     | NullT _ -> Some (desc_of_reason (reason_of_t t))
     | _ -> None
   in
-  let fallback t = assert_false (string_of_ctor t) in
+  let fallback t =
+    assert_false (spf "Missing printer for %s" (string_of_ctor t))
+  in
   fun enclosure cx t ->
     type_printer override fallback enclosure cx t
 
@@ -1721,7 +1836,7 @@ and _json_of_t_impl json_cx t = Json.(
 
   | SetT (_, name, t)
   | GetT (_, name, t) -> [
-      "propName", JString name;
+      "propName", json_of_proptype json_cx name;
       "propType", _json_of_t json_cx t
     ]
 
@@ -1767,6 +1882,10 @@ and _json_of_t_impl json_cx t = Json.(
   | OrT (_, right, res) -> [
       "rightType", _json_of_t json_cx right;
       "resultType", _json_of_t json_cx res
+    ]
+
+  | NotT (_, t) -> [
+      "type", _json_of_t json_cx t
     ]
 
   | SpecializeT (_, cache, targs, tvar) -> [
@@ -1907,7 +2026,9 @@ and json_of_flags json_cx = check_depth json_of_flags_impl json_cx
 and json_of_flags_impl json_cx flags = Json.(
   JAssoc [
     "frozen", JBool flags.frozen;
-    "sealed", JBool flags.sealed;
+    "sealed", JBool (match flags.sealed with
+      | Sealed -> true
+      | UnsealedInFile _ -> false);
     "exact", JBool flags.exact;
   ]
 )
@@ -1949,6 +2070,14 @@ and json_of_polarity_map_impl json_cx pmap = Json.(
     JAssoc ["name", JString name; "polarity", json_of_polarity json_cx pol] :: acc
   ) pmap [] in
   JList (List.rev lst)
+)
+
+and json_of_proptype json_cx = check_depth json_of_proptype_impl json_cx
+and json_of_proptype_impl json_cx (reason, literal) = Json.(
+  JAssoc [
+    "reason", json_of_reason reason;
+    "literal", JString literal;
+  ]
 )
 
 and json_of_tmap json_cx = check_depth json_of_tmap_impl json_cx
@@ -2096,9 +2225,9 @@ and dump_t_ =
     | MixedT _
     | AnyT _
     | NullT _ -> Some (string_of_ctor t)
-    | SetT (_, n, t) ->
+    | SetT (_, (_, n), t) ->
         Some (spf "SetT(%s: %s)" n (dump_t_ stack cx t))
-    | GetT (_, n, t) ->
+    | GetT (_, (_, n), t) ->
         Some (spf "GetT(%s: %s)" n (dump_t_ stack cx t))
     | LookupT (_, _, n, t) ->
         Some (spf "LookupT(%s: %s)" n (dump_t_ stack cx t))
@@ -2210,6 +2339,9 @@ let rec is_printed_type_parsable_impl weak cx enclosure = function
     ->
       true
 
+  | AnnotT (_, t) ->
+      is_printed_type_parsable_impl weak cx enclosure t
+
   (* Composed types *)
   | MaybeT t
     ->
@@ -2317,29 +2449,72 @@ let is_printed_param_type_parsable ?(weak=false) cx t =
 
 (* scopes and types *)
 
-let string_of_scope cx scope = Scope.(
+let string_of_loc_opt = function
+| Some loc -> string_of_loc loc
+| None -> "(none)"
 
-  let string_of_entry cx entry =
-    let pos = match entry.def_loc with
-    | Some loc -> string_of_loc loc
-    | None -> "(none)"
-    in
-    Utils.spf "{ specific: %s; general: %s; def_loc: %s; for_type: %b }"
-      (dump_t cx entry.specific)
-      (dump_t cx entry.general)
-      pos
-      entry.for_type
+let string_of_entry = Scope.(
+
+  let string_of_value cx {
+    Entry.kind; value_state; value_loc; specific; general
+  } =
+    Utils.spf "{ kind: %s; value_state: %s; value_loc: %s; \
+      specific: %s; general: %s }"
+      (Entry.string_of_value_kind kind)
+      (Entry.string_of_state value_state)
+      (string_of_loc_opt value_loc)
+      (dump_t cx specific)
+      (dump_t cx general)
   in
 
+  let string_of_type cx { Entry.type_state; type_loc; _type } =
+    Utils.spf "{ type_state: %s; type_loc: %s; _type: %s }"
+      (Entry.string_of_state type_state)
+      (string_of_loc_opt type_loc)
+      (dump_t cx _type)
+  in
+
+  fun cx -> Entry.(function
+  | Value r -> spf "Value %s" (string_of_value cx r)
+  | Type r -> spf "Type %s" (string_of_type cx r)
+  )
+)
+
+let string_of_scope = Scope.(
+
   let string_of_entries cx entries =
-    SMap.fold (fun k v acc ->
-      (Utils.spf "%s: %s" k (string_of_entry cx v))::acc
+    SMap.fold (fun name entry acc ->
+      (Utils.spf "%s: %s" name (string_of_entry cx entry))
+        :: acc
     ) entries []
     |> String.concat ";\n  "
   in
 
-  Utils.spf "{ entries:\n%s\n}"
-    (string_of_entries cx scope.entries)
+  let string_of_refi cx { refi_loc; refined; original } =
+    Utils.spf "{ refi_loc: %s; refined: %s; original: %s }"
+      (string_of_loc_opt refi_loc)
+      (dump_t cx refined)
+      (dump_t cx original)
+  in
+
+  let string_of_refis cx refis =
+    KeyMap.fold (fun key refi acc ->
+      (Utils.spf "%s: %s" (Key.string_of_key key) (string_of_refi cx refi))
+        :: acc
+    ) refis []
+    |> String.concat ";\n  "
+  in
+
+  let string_of_scope_kind = function
+  | VarScope attrs -> spf "VarScope { async: %b }" attrs.async
+  | LexScope -> "Lex"
+  in
+
+  fun cx scope ->
+    Utils.spf "{ kind: %s;\nentries:\n%s\nrefis:\n%s\n}"
+      (string_of_scope_kind scope.kind)
+      (string_of_entries cx scope.entries)
+      (string_of_refis cx scope.refis)
 )
 
 (*****************************************************************)
@@ -2366,7 +2541,7 @@ let prep_path r =
 let pos_len r =
   let r = prep_path r in
   let loc = loc_of_reason r in
-  let fmt = Errors_js.format_reason_color (loc, "") in
+  let fmt = Errors_js.(format_reason_color (BlameM (loc, ""))) in
   let str = String.concat "" (List.map snd fmt) in
   String.length str
 
@@ -2571,6 +2746,7 @@ class ['a] type_visitor = object(self)
   | EqT (_, _)
   | AndT (_, _, _)
   | OrT (_, _, _)
+  | NotT (_, _)
   | SpecializeT (_, _, _, _)
   | LookupT (_, _, _, _)
   | ObjAssignT (_, _, _, _, _)

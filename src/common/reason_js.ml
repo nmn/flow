@@ -122,11 +122,13 @@ let string_of_loc loc = Loc.(
     let start = loc.start.column + 1 in
     let end_ = loc._end.column in
     if line <= 0 then
-      spf "File \"%s\"" file
-    else if line = loc._end.line && start - end_ = 1 then
-      spf "File \"%s\", line %d, character %d" file line start
+      spf "%s:0:0" file
+    else if line = loc._end.line && start = end_ then
+      spf "%s:%d:%d" file line start
+    else if line != loc._end.line then
+      spf "%s:%d:%d,%d:%d" file line start loc._end.line end_
     else
-      spf "File \"%s\", line %d, characters %d-%d" file line start end_
+      spf "%s:%d:%d-%d" file line start end_
 )
 
 let json_of_loc loc = Json.(Loc.(
@@ -181,7 +183,7 @@ let json_of_reason r = Json.(
 )
 
 let dump_reason r =
-  spf "[%s] %S" (string_of_loc (loc_of_reason r)) r.desc
+  spf "%s: %S" (string_of_loc (loc_of_reason r)) r.desc
 
 let desc_of_reason r =
   r.desc
@@ -214,9 +216,6 @@ let is_builtin_reason r =
 (* reasons compare on their locations *)
 let compare r1 r2 =
   Pervasives.compare (loc_of_reason r1) (loc_of_reason r2)
-
-let same_scope r1 r2 =
-  r1.loc.Loc.source = r2.loc.Loc.source
 
 (* reason transformers: *)
 

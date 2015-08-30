@@ -8,10 +8,10 @@
  *
  *)
 
-
-open Utils
+open Core
 open Typing_defs
 open Typing_dependent_type
+open Utils
 
 module Env = Typing_env
 module TUtils = Typing_utils
@@ -148,10 +148,18 @@ let rec localize_with_env ~ety_env env (dty: decl ty) =
   | r, Tapply ((_, x), argl) when Env.is_typedef x ->
       let env, argl = lfold (localize ~ety_env) env argl in
       TUtils.expand_typedef ety_env env r x argl
-  | r, Tapply ((_, x), _argl) when Env.is_enum x ->
+  | r, Tapply ((p, x), _argl) when Env.is_enum x ->
       (* if argl <> [], nastInitCheck would have raised an error *)
-      let env, cstr = opt (localize ~ety_env) env (Env.get_enum_constraint x) in
-      env, (ety_env, (r, Tabstract (AKenum x, cstr)))
+      if Typing_defs.has_expanded ety_env x then begin
+        Errors.cyclic_enum_constraint p;
+        env, (ety_env, (r, Tany))
+      end else begin
+        let type_expansions = (p, x) :: ety_env.type_expansions in
+        let ety_env = {ety_env with type_expansions} in
+        let env, cstr =
+          opt (localize ~ety_env) env (Env.get_enum_constraint x) in
+        env, (ety_env, (r, Tabstract (AKenum x, cstr)))
+      end
   | r, Tapply (cls, tyl) ->
       let env, tyl = lfold (localize ~ety_env) env tyl in
       env, (ety_env, (r, Tclass (cls, tyl)))
@@ -184,27 +192,21 @@ and localize_ft ?(instantiate_tparams=true) ~ety_env env ft =
     then let env, tvarl = lfold TUtils.unresolved_tparam env ft.ft_tparams in
          let ft_subst = TSubst.make ft.ft_tparams tvarl in
          env, SMap.union ft_subst ety_env.substs
-    else env, List.fold_left begin fun subst (_, (_, x), _) ->
+    else env, List.fold_left ft.ft_tparams ~f:begin fun subst (_, (_, x), _) ->
       SMap.remove x subst
-    end ety_env.substs ft.ft_tparams in
+    end ~init:ety_env.substs in
   let ety_env = {ety_env with substs = substs} in
-  let names, params = List.split ft.ft_params in
-  let env, params = lfold (localize ~ety_env) env params in
+  let env, params = lfold begin fun env (name, param) ->
+    let env, param = localize ~ety_env env param in
+    env, (name, param)
+  end env ft.ft_params in
   let env, arity = match ft.ft_arity with
     | Fvariadic (min, (name, var_ty)) ->
        let env, var_ty = localize ~ety_env env var_ty in
        env, Fvariadic (min, (name, var_ty))
     | Fellipsis _ | Fstandard (_, _) as x -> env, x in
   let env, ret = localize ~ety_env env ft.ft_ret in
-  let params = List.map2 (fun x y -> x, y) names params in
   env, { ft with ft_arity = arity; ft_params = params; ft_ret = ret }
-
-let localize_phase ~ety_env env phase_ty =
-  match phase_ty with
-  | DeclTy ty ->
-     localize ~ety_env env ty
-  | LoclTy ty ->
-     env, ty
 
 let env_with_self env =
   {

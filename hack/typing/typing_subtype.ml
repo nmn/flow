@@ -8,22 +8,19 @@
  *
  *)
 
+open Core
 open Utils
 open Typing_defs
 open Typing_dependent_type
 
 module Reason = Typing_reason
-module Inst = Typing_instantiate
 module Unify = Typing_unify
 module Env = Typing_env
 module DefsDB = Typing_heap
-module TDef = Typing_tdef
 module TSubst = Typing_subst
 module TUtils = Typing_utils
 module TUEnv = Typing_unification_env
-module ShapeMap = Nast.ShapeMap
 module SN = Naming_special_names
-module TAccess = Typing_taccess
 module Phase = Typing_phase
 
 (* This function checks that the method ft_sub can be used to replace
@@ -107,6 +104,16 @@ and subtype_tparams env c_name variancel super_tyl children_tyl =
       let env = subtype_tparam env c_name variance super child in
       subtype_tparams env c_name variancel superl childrenl
 
+and invariance_suggestion c_name =
+  let open Naming_special_names.Collections in
+  if c_name = cVector then
+    "\nDid you mean ConstVector instead?"
+  else if c_name = cMap then
+    "\nDid you mean ConstMap instead?"
+  else if c_name = cSet then
+    "\nDid you mean ConstSet instead?"
+  else ""
+
 and subtype_tparam env c_name variance (r_super, _ as super) child =
   match variance with
   | Ast.Covariant -> sub_type env super child
@@ -117,7 +124,17 @@ and subtype_tparam env c_name variance (r_super, _ as super) child =
         (fun err ->
           let pos = Reason.to_pos r_super in
           Errors.explain_contravariance pos c_name err; env)
-  | Ast.Invariant -> fst (Unify.unify env super child)
+  | Ast.Invariant ->
+      Errors.try_
+        (fun () -> fst (Unify.unify env super child))
+        (fun err ->
+          let suggestion =
+            let s = invariance_suggestion c_name in
+            let try_fun = (fun () ->
+              subtype_tparam env c_name Ast.Covariant super child) in
+            if not (s = "") && Errors.has_no_errors try_fun then s else "" in
+          let pos = Reason.to_pos r_super in
+          Errors.explain_invariance pos c_name suggestion err; env)
 
 (* Distinction b/w sub_type and sub_type_with_uenv similar to unify and
  * unify_with_uenv, see comment there. *)
@@ -267,9 +284,9 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
       fst (Unify.unify_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub))
   | _, (_, Tunresolved tyl) when Env.grow_super env ->
       let uenv_sub = {uenv_sub with TUEnv.seen_tvars = seen_tvars_sub} in
-      List.fold_left begin fun env x ->
+      List.fold_left tyl ~f:begin fun env x ->
         sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, x)
-      end env tyl
+      end ~init:env
 (****************************************************************************)
 (* Repeat the previous 3 cases but with the super / sub order reversed *)
 (****************************************************************************)
@@ -282,9 +299,9 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
       fst (Unify.unify_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub))
   | (_, Tunresolved tyl), _ when not (Env.grow_super env) ->
       let uenv_super = {uenv_super with TUEnv.seen_tvars = seen_tvars_super} in
-      List.fold_left begin fun env x ->
+      List.fold_left tyl ~f:begin fun env x ->
         sub_type_with_uenv env (uenv_super, x) (uenv_sub, ty_sub)
-      end env tyl
+      end ~init:env
 (****************************************************************************)
 (* OCaml doesn't inspect `when` clauses when checking pattern matching
  * exhaustiveness, so just assert false here *)
@@ -340,8 +357,7 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
     when stringish = SN.Classes.cStringish &&
       AbstractKind.is_classname ak -> env
   | (p_super, (Tclass (x_super, tyl_super) as ty_super_)),
-      (p_sub, (Tclass (x_sub, tyl_sub) as ty_sub_))
-      when Typing_env.get_enum_constraint (snd x_sub) = None  ->
+      (p_sub, (Tclass (x_sub, tyl_sub) as ty_sub_)) ->
     let cid_super, cid_sub = (snd x_super), (snd x_sub) in
     if cid_super = cid_sub then
       if tyl_super <> [] && List.length tyl_super = List.length tyl_sub
@@ -350,7 +366,7 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
         | None -> fst (Unify.unify env ety_super ety_sub)
         | Some { tc_tparams; _} ->
             let variancel =
-              List.map (fun (variance, _, _) -> variance) tc_tparams
+              List.map tc_tparams (fun (variance, _, _) -> variance)
             in
             subtype_tparams env cid_super variancel tyl_super tyl_sub
       else fst (Unify.unify env ety_super ety_sub)
@@ -392,7 +408,7 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
                   (* We handle the case where a generic A<T> is used as A *)
                   let tyl_sub =
                     if tyl_sub = [] && not (Env.is_strict env)
-                    then List.map (fun _ -> (p_sub, Tany)) class_.tc_tparams
+                    then List.map class_.tc_tparams (fun _ -> (p_sub, Tany))
                     else tyl_sub
                   in
                   if List.length class_.tc_tparams <> List.length tyl_sub
@@ -424,8 +440,7 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
     end
   | (_, Tmixed), _ -> env
   | (_, Tprim Nast.Tnum), (_, Tprim (Nast.Tint | Nast.Tfloat)) -> env
-  | (_, Tprim Nast.Tarraykey), (_, Tprim (Nast.Tint | Nast.Tstring | Nast.Tclassname _)) -> env
-  | (_, Tprim Nast.Tstring), (_, Tprim (Nast.Tclassname _)) -> env
+  | (_, Tprim Nast.Tarraykey), (_, Tprim (Nast.Tint | Nast.Tstring)) -> env
   | (_, Tprim (Nast.Tstring | Nast.Tarraykey)), (_, Tabstract (ak, _))
     when AbstractKind.is_classname ak -> env
   | (_, Tclass ((_, coll), [tv_super])), (_, Tarray (ty3, ty4))
@@ -454,10 +469,10 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
               sub_type env tv_super ty4
           )
       )
-  | (_, Tclass ((_, stringish), _)), (_, Tprim (Nast.Tstring | Nast.Tclassname _))
+  | (_, Tclass ((_, stringish), _)), (_, Tprim Nast.Tstring)
     when stringish = SN.Classes.cStringish -> env
   | (_, Tclass ((_, xhp_child), _)), (_, Tarray _)
-  | (_, Tclass ((_, xhp_child), _)), (_, Tprim (Nast.Tint | Nast.Tfloat | Nast.Tstring | Nast.Tclassname _ | Nast.Tnum))
+  | (_, Tclass ((_, xhp_child), _)), (_, Tprim (Nast.Tint | Nast.Tfloat | Nast.Tstring | Nast.Tnum))
     when xhp_child = SN.Classes.cXHPChild -> env
   | (_, (Tarray (Some ty_super, None))), (_, (Tarray (Some ty_sub, None))) ->
       sub_type env ty_super ty_sub
@@ -525,13 +540,6 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
         (env, None)
         (r_super, fields_known_super, fdm_super)
         (r_sub, fields_known_sub, fdm_sub))
-  | (_, Tabstract (AKnewtype (name_classname, [tyl1]), _)),
-    (r_sub, Tprim (Nast.Tclassname name_cls))
-    when name_classname = SN.Classes.cClassname ->
-    (* XXX: Do we need to look up the class and add missing Tanys? *)
-    let p_sub = Reason.to_pos r_sub in
-    let ty_cls = r_sub, Tclass ((p_sub, name_cls), []) in
-    sub_type env tyl1 ty_cls
   | (_, Tabstract (AKnewtype (name_super, tyl_super), _)),
     (_, Tabstract (AKnewtype (name_sub, tyl_sub), _))
     when name_super = name_sub ->
@@ -539,7 +547,7 @@ and sub_type_with_uenv env (uenv_super, ty_super) (uenv_sub, ty_sub) =
       (match td with
       | Some (DefsDB.Typedef.Ok (_, tparams, _, _, _)) ->
           let variancel =
-            List.map (fun (variance, _, _) -> variance) tparams
+            List.map tparams (fun (variance, _, _) -> variance)
           in
           subtype_tparams env name_super variancel tyl_super tyl_sub
       | _ -> env
@@ -590,7 +598,7 @@ and sub_string p env ty2 =
   match ety2 with
   | (_, Toption ty2) -> sub_string p env ty2
   | (_, Tunresolved tyl) ->
-      List.fold_left (sub_string p) env tyl
+      List.fold_left tyl ~f:(sub_string p) ~init:env
   | (_, Tprim _) ->
       env
   | (_, Tabstract (AKenum _, _)) ->

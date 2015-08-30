@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Typing_defs
 open Utils
 
@@ -44,14 +45,14 @@ module ExprDepTy = struct
           p, Reason.ERclass cls, `cls cls
       | N.CIstatic ->
           pos, Reason.ERstatic, `static
-      | N.CIvar (p, N.This) ->
+      | N.CIexpr (p, N.This) ->
           p, Reason.ERstatic, `static
       (* If it is a local variable then we look up the expression id associated
        * with it. If one doesn't exist we generate a new one. We are being
        * conservative here because the new expression id we create isn't
        * added to the local enviornment.
        *)
-      | N.CIvar (p, N.Lvar (_, x)) ->
+      | N.CIexpr (p, N.Lvar (_, x)) ->
           let ereason, dep = match Env.get_local_expr_id env x with
             | Some eid -> Reason.ERexpr eid, `expr eid
             | None -> new_() in
@@ -59,7 +60,7 @@ module ExprDepTy = struct
       (* If all else fails we generate a new identifier for our expression
        * dependent type.
        *)
-      | N.CIvar (p, _) ->
+      | N.CIexpr (p, _) ->
           let ereason, dep = new_() in
           p, ereason, dep in
     (Reason.Rexpr_dep_type (reason, pos, expr_dep_reason), (dep, []))
@@ -68,9 +69,9 @@ module ExprDepTy = struct
    * locl ty to create a new locl ty
    *)
   let apply dep_tys ty =
-    List.fold_left begin fun ty (r, dep_ty) ->
+    List.fold_left dep_tys ~f:begin fun ty (r, dep_ty) ->
       r, Tabstract (AKdependent dep_ty, Some ty)
-    end ty dep_tys
+    end ~init:ty
 
   (* We do not want to create a new expression dependent type if the type is
    * already expression dependent. However if the type is Tunresolved that
@@ -104,7 +105,7 @@ module ExprDepTy = struct
         let env, seen, ty = Env.expand_type_recorded env seen ty in
         should_apply ~seen env ty
     | Tunresolved tyl ->
-        List.exists (should_apply ~seen env) tyl
+        List.exists tyl (should_apply ~seen env)
     | Tclass ((_, x), _) ->
         let class_ = Env.get_class env x in
         Option.value_map class_
@@ -121,7 +122,7 @@ module ExprDepTy = struct
    * here is a high level break down:
    *
    * 1) When a class member "bar" is accessed via "[CID]->bar" or "[CID]::bar"
-   * we resolves "<this>" in the type of "bar" to "<[CID]>"
+   * we resolve "<this>" in the type of "bar" to "<[CID]>"
    *
    * 2) When typing a method, we resolve "<this>" in the return type to
    * "this"

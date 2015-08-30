@@ -74,8 +74,9 @@ let emit_file { filename; read_stdin; is_test } () =
       file_mode; funs; classes; typedefs; consts; comments;
       consider_names_just_for_autoload = false } in
 
-  if file_mode <> Some FileInfo.Mstrict then
-    die "Can only emit files in strict mode\n";
+  if file_mode <> Some FileInfo.Mstrict &&
+     file_mode <> Some FileInfo.Mpartial then
+    die "Can only emit files in strict/partial mode\n";
 
   Parser_heap.ParserHeap.add filename ast;
 
@@ -92,7 +93,7 @@ let emit_file { filename; read_stdin; is_test } () =
   Typing_decl.make_env nenv all_classes filename;
 
   (* Actually emit. *)
-  Emitter.emit_file ~is_test nenv filename file_info
+  Emitter.emit_file ~is_test nenv filename ast file_info
 
 
 let main_hack options =

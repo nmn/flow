@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Typing_defs
 
 module N = Nast
@@ -53,7 +54,7 @@ let rec is_option env ty =
   match snd ety with
   | Toption _ -> true
   | Tunresolved tyl ->
-      List.exists (is_option env) tyl
+      List.exists tyl (is_option env)
   | _ -> false
 
 let is_class ty = match snd ty with
@@ -207,6 +208,16 @@ and normalize_inter env tyl1 tyl2 =
       let env, tyl2 = member_inter env x tyl2 [] in
       normalize_inter env rl tyl2
 
+let normalize_inter env tyl1 tyl2 =
+  if List.length tyl1 + List.length tyl2 > 100
+  then
+    (* normalization is O(len(tyl1) * len(tyl2)), so just appending is
+     * a significant perf win here *)
+    env, (List.rev_append tyl1 tyl2)
+  else
+    (* TODO this should probably pass through the uenv *)
+    normalize_inter env tyl1 tyl2
+
 (*****************************************************************************)
 (* *)
 (*****************************************************************************)
@@ -232,9 +243,9 @@ let fold_unresolved env ty =
   | _, Tunresolved (x :: rl) ->
       (try
         let env, acc =
-          List.fold_left begin fun (env, acc) ty ->
+          List.fold_left rl ~f:begin fun (env, acc) ty ->
             Errors.try_ (fun () -> unify env acc ty) (fun _ -> raise Exit)
-          end (env, x) rl in
+          end ~init:(env, x) in
         env, acc
       with Exit ->
         env, ty
@@ -308,11 +319,12 @@ end = struct
       inherit [bool] TypeVisitor.type_visitor
       method! on_tany _ = true
       method! on_tarray acc ty1_opt ty2_opt =
-        (* Check for array without its value type parameter specified *)
-        (match ty2_opt with
-        | None -> true
-        | Some ty -> this#on_type acc ty) ||
-        (Option.fold ~f:this#on_type ~init:acc ty1_opt)
+        (* Check for array without its type parameters specified *)
+        match ty1_opt, ty2_opt with
+        | None, None -> true
+        | _ ->
+          (Option.fold ~f:this#on_type ~init:acc ty1_opt) ||
+          (Option.fold ~f:this#on_type ~init:acc ty2_opt)
     end
   let check ty = visitor#on_type false ty
 end

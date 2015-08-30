@@ -56,6 +56,8 @@ end = struct
   let commands = ShellCommand.command :: commands
 
   let main () =
+    Daemon.check_entry_point (); (* this call might not return *)
+
     Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
     let default_command = DefaultCommand.command in
     let argv = Array.to_list Sys.argv in
@@ -74,7 +76,8 @@ end = struct
           (default_command, cmd::default::next::rest)
     in
     let command_string = CommandSpec.name command in
-    FlowEventLogger.init_flow_command command_string;
+    FlowEventLogger.set_command (Some command_string);
+    FlowEventLogger.init_flow_command ();
     CommandSpec.run command argv
 
 end

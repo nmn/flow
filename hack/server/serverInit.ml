@@ -8,17 +8,19 @@
  *
  *)
 
+open Core
 open ServerEnv
 
 (* Initialization of the server *)
 let init_hack genv env get_next =
 
+  let t = Unix.gettimeofday () in
   let files_info, errorl1, failed1 =
-    Hh_logger.measure "Parsing" begin fun () ->
-      Parsing_service.go genv.workers ~get_next
-    end in
-
-  Hh_logger.log "Heap size: %d" (SharedMem.heap_size ());
+      Parsing_service.go genv.workers ~get_next in
+  let hs = SharedMem.heap_size () in
+  Hh_logger.log "Heap size: %d" hs;
+  Stats.(stats.init_parsing_heap_size <- hs);
+  let t = Hh_logger.log_duration "Parsing" t in
 
   let is_check_mode =
     ServerArgs.check_mode genv.options &&
@@ -27,44 +29,51 @@ let init_hack genv env get_next =
     ServerArgs.save_filename genv.options = None
   in
 
-  let is_ai_mode = ServerArgs.ai_mode genv.options in
+  let ai_mode = ServerArgs.ai_mode genv.options in
 
-  if not (is_check_mode || is_ai_mode) then begin
+  let t = if is_check_mode then t else begin
     Typing_deps.update_files files_info;
-  end;
+    Hh_logger.log_duration "Updating deps" t
+  end in
 
-  let errorl2, failed2, nenv = Hh_logger.measure "Naming" begin fun () ->
+  let errorl2, failed2, nenv =
     Relative_path.Map.fold
-      Naming.ndecl_file files_info ([], Relative_path.Set.empty, env.nenv)
-  end in
+      Naming.ndecl_file files_info ([], Relative_path.Set.empty, env.nenv) in
+  let t = Hh_logger.log_duration "Naming" t in
 
-  let fast, errorl3, failed3 = Hh_logger.measure "Type-decl" begin fun () ->
-    let fast = FileInfo.simplify_fast files_info in
-    let fast = Relative_path.Set.fold Relative_path.Map.remove failed2 fast in
-    let errorl3, failed3 = Typing_decl_service.go genv.workers nenv fast in
-    fast, errorl3, failed3
-  end in
+  let fast = FileInfo.simplify_fast files_info in
+  let fast = Relative_path.Set.fold Relative_path.Map.remove failed2 fast in
+  let errorl3, failed3 = Typing_decl_service.go genv.workers nenv fast in
+  let hs = SharedMem.heap_size () in
+  Hh_logger.log "Heap size: %d" hs;
+  Stats.(stats.init_heap_size <- hs);
+  let t = Hh_logger.log_duration "Type-decl" t in
 
-  Hh_logger.log "Heap size: %d" (SharedMem.heap_size ());
-
-  let errorl4, failed4 = if not is_ai_mode then
-      Hh_logger.measure "Type-check" begin fun () ->
-        Typing_check_service.go genv.workers nenv fast
-      end
+  let errorl4, failed4, t =
+    if ai_mode = None || not is_check_mode then
+      let e, f = Typing_check_service.go genv.workers nenv fast in
+      let t = Hh_logger.log_duration "Type-check" t in
+      e, f, t
     else
-      [],  Relative_path.Set.empty in
+      [],  Relative_path.Set.empty, t in
 
-  let errorl5, failed5 = if is_ai_mode then
-      Hh_logger.measure "Ai" begin fun () ->
-        Ai.go Typing_check_utils.check_defs genv.workers files_info nenv
-      end
-    else
-      [], Relative_path.Set.empty in
+  let errorl5, failed5, t = match ai_mode with
+    | Some optstr ->
+        let files_info =
+          Relative_path.Set.fold Relative_path.Map.remove failed2 files_info in
+        let files_info =
+          Relative_path.Set.fold Relative_path.Map.remove failed3 files_info in
+        let e, f = Ai.go
+          Typing_check_utils.check_defs genv.workers files_info nenv optstr in
+        let t = Hh_logger.log_duration "Ai" t in
+        e, f, t
+    | None ->
+        [], Relative_path.Set.empty, t in
 
   let failed =
-    List.fold_right Relative_path.Set.union
-      [failed1; failed2; failed3; failed4; failed5]
-      Relative_path.Set.empty in
+    List.fold_right [failed1; failed2; failed3; failed4; failed5]
+      ~f:Relative_path.Set.union
+      ~init:Relative_path.Set.empty in
   let env = { env with files_info = files_info; nenv = nenv } in
 
   SharedMem.init_done();
@@ -79,8 +88,9 @@ let init_hack genv env get_next =
   Hh_logger.log "Hashtable load factor: %d / %d (%.02f)"
     used_slots slots load_factor;
 
-  let errorl = List.fold_right List.rev_append
-      [errorl1; errorl2; errorl3; errorl4; errorl5] [] in
+  let errorl = List.fold_right [errorl1; errorl2; errorl3; errorl4; errorl5]
+    ~f:List.rev_append
+    ~init:[] in
   env, errorl, failed
 
 (* entry point *)

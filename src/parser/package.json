@@ -1,6 +1,7 @@
 {
   "name": "flow-parser",
-  "version": "0.6.0",
+  "version": "0.7.0",
+  "license": "BSD-3-Clause",
   "description": "JavaScript parser written in OCaml. Produces SpiderMonkey AST",
   "author": {
     "name": "Gabe Levi",
@@ -15,7 +16,7 @@
     "private": true
   },
   "devDependencies": {
-    "esprima-fb": "15001.1.0-dev-harmony-fb"
+    "esprima-fb": "15001.1001.0-dev-harmony-fb"
   },
   "dependencies": {
     "ast-types": "0.8.4",

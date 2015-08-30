@@ -17,7 +17,7 @@ open Sys_utils
 (*****************************************************************************)
 
 type mode =
-  | Ai
+  | Ai of string
   | Autocomplete
   | Color
   | Coverage
@@ -25,6 +25,7 @@ type mode =
   | Errors
   | Lint
   | Suggest
+  | NoBuiltins
 
 type options = {
   filename : string;
@@ -34,7 +35,9 @@ type options = {
 let builtins_filename =
   Relative_path.create Relative_path.Dummy "builtins.hhi"
 
-let builtins = "<?hh // decl\n"^
+let what_builtins mode = match mode with
+  NoBuiltins -> ""
+  | _ -> "<?hh // decl\n"^
   "interface Traversable<+Tv> {}\n"^
   "interface Container<+Tv> extends Traversable<Tv> {}\n"^
   "interface Iterator<+Tv> extends Traversable<Tv> {}\n"^
@@ -135,7 +138,39 @@ let builtins = "<?hh // decl\n"^
   "function var_dump($x): void;\n" ^
   "function gena();\n" ^
   "function genva();\n" ^
-  "function gen_array_rec();\n"
+  "function gen_array_rec();\n"^
+  "function is_int(mixed $x): bool {}\n"^
+  "function is_bool(mixed $x): bool {}\n"^
+  "function is_float(mixed $x): bool {}\n"^
+  "function is_string(mixed $x): bool {}\n"^
+  "function is_null(mixed $x): bool {}\n"^
+  "function is_array(mixed $x): bool {}\n"^
+  "function is_resource(mixed $x): bool {}\n"^
+  "interface IMemoizeParam {\n"^
+  "  public function getInstanceKey(): string;\n"^
+  "}\n"^
+  "type TypeStructure<T> = shape(\n"^
+  "  'kind'=>int,\n"^
+  "  'nullable'=>?bool,\n"^
+  "  'classname'=>?classname<T>,\n"^
+  "  'elem_types' => ?array,\n"^
+  "  'param_types' => ?array,\n"^
+  "  'return_type' => ?array,\n"^
+  "  'generic_types' => ?array,\n"^
+  "  'fields' => ?array,\n"^
+  "  'name' => ?string,\n"^
+  "  'alias' => ?string,\n"^
+  ");\n"^
+  "function type_structure($x, $y);\n"^
+  "const int __LINE__ = 0;\n"^
+  "const string __CLASS__ = '';\n"^
+  "const string __TRAIT__ = '';\n"^
+  "const string __FILE__ = '';\n"^
+  "const string __DIR__ = '';\n"^
+  "const string __FUNCTION__ = '';\n"^
+  "const string __METHOD__ = '';\n"^
+  "const string __NAMESPACE__ = '';\n"
+
 
 (*****************************************************************************)
 (* Helpers *)
@@ -156,11 +191,11 @@ let parse_options () =
   let set_mode x () =
     if !mode <> Errors
     then raise (Arg.Bad "only a single mode should be specified")
-    else mode := x
-  in
+    else mode := x in
+  let set_ai x = set_mode (Ai x) () in
   let options = [
     "--ai",
-      Arg.Unit (set_mode Ai),
+      Arg.String (set_ai),
       "Run the abstract interpreter";
     "--auto-complete",
       Arg.Unit (set_mode Autocomplete),
@@ -180,6 +215,9 @@ let parse_options () =
     "--suggest",
       Arg.Unit (set_mode Suggest),
       "Suggest missing typehints";
+    "--no-builtins",
+      Arg.Unit (set_mode NoBuiltins),
+      "Don't use builtins (e.g. ConstSet)";
   ] in
   Arg.parse options (fun fn -> fn_ref := Some fn) usage;
   let fn = match !fn_ref with
@@ -277,7 +315,7 @@ let print_coverage fn type_acc =
 
 let handle_mode mode filename nenv files_contents files_info errors ai_results =
   match mode with
-  | Ai -> ()
+  | Ai _ -> ()
   | Autocomplete ->
       let file = cat (Relative_path.to_absolute filename) in
       let result = ServerAutoComplete.auto_complete nenv file in
@@ -330,6 +368,7 @@ let handle_mode mode filename nenv files_contents files_info errors ai_results =
       end
       else Printf.printf "No lint errors\n"
   | Suggest
+  | NoBuiltins
   | Errors ->
       let errors = Relative_path.Map.fold begin fun _ fileinfo errors ->
         errors @ Typing_check_utils.check_defs nenv fileinfo
@@ -345,19 +384,23 @@ let handle_mode mode filename nenv files_contents files_info errors ai_results =
 (*****************************************************************************)
 
 let main_hack { filename; mode; } =
-  ignore (Sys.signal Sys.sigusr1 (Sys.Signal_handle Typing.debug_print_last_pos));
+  if not Sys.win32 then
+    ignore (Sys.signal Sys.sigusr1
+              (Sys.Signal_handle Typing.debug_print_last_pos));
   EventLogger.init (Daemon.devnull ()) 0.0;
   SharedMem.(init default_config);
-  Hhi.set_hhi_root_for_unit_test (Path.make "/tmp/hhi");
+  let tmp_hhi = Path.concat Path.temp_dir_name "hhi" in
+  Hhi.set_hhi_root_for_unit_test tmp_hhi;
   let outer_do f = match mode with
-    | Ai ->
+    | Ai ai_options ->
         let ai_results, inner_results =
-          Ai.do_ Typing_check_utils.check_defs filename in
+          Ai.do_ Typing_check_utils.check_defs filename ai_options in
         ai_results, inner_results
     | _ ->
         let inner_results = f () in
         [], inner_results
   in
+  let builtins = what_builtins mode in
   let filename = Relative_path.create Relative_path.Dummy filename in
   let files_contents = file_to_files filename in
   let ai_results, (errors, (nenv, files_info)) =
@@ -407,5 +450,10 @@ let _ =
   if ! Sys.interactive
   then ()
   else
+    (* On windows, setting 'binary mode' avoids to output CRLF on
+       stdout.  The 'text mode' would not hurt the user in general, but
+       it breaks the testsuite where the output is compared to the
+       expected one (i.e. in given file without CRLF). *)
+    set_binary_mode_out stdout true;
     let options = parse_options () in
-    main_hack options
+    Unix.handle_unix_error main_hack options

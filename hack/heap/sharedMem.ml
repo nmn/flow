@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Utils
 
 type config = {
@@ -35,7 +36,7 @@ let init config =
  * free data (cf hh_shared.c for the underlying C implementation).
  *)
 (*****************************************************************************)
-external hh_collect: unit -> unit = "hh_collect"
+external hh_collect: bool -> unit = "hh_collect"
 
 (*****************************************************************************)
 (* Serializes the shared memory and writes it to a file *)
@@ -97,11 +98,18 @@ let hash_stats () = {
   slots = hash_slots ();
 }
 
-let collect () =
+let collect (effort : [ `gentle | `aggressive ]) =
   let old_size = heap_size () in
-  hh_collect ();
+  Stats.update_max_heap_size old_size;
+  let start_t = Unix.gettimeofday () in
+  hh_collect (effort = `aggressive);
   let new_size = heap_size () in
-  EventLogger.sharedmem_gc old_size new_size
+  let time_taken = Unix.gettimeofday () -. start_t in
+  if old_size <> new_size then
+    Hh_logger.log
+      "Sharedmem GC: %d bytes before; %d bytes after; in %f seconds"
+      old_size new_size time_taken;
+  EventLogger.sharedmem_gc old_size new_size time_taken
 
 (*****************************************************************************)
 (* Module returning the MD5 of the key. It's because the code in C land
@@ -573,7 +581,7 @@ end
 
 let invalidate_callback_list = ref []
 let invalidate_caches () =
-  List.iter begin fun callback -> callback() end !invalidate_callback_list
+  List.iter !invalidate_callback_list begin fun callback -> callback() end
 
 (*****************************************************************************)
 (* A functor returning an implementation of the S module with caching.

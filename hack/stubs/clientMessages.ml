@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,12 +8,5 @@
  *
  *)
 
-
-
-(* Must be called before the main loop goes to sleep *)
-val call_before_sleeping: unit -> unit
-
-(* Called every time a client connects *)
-val stamp_connection: unit -> unit
-
-val init: Path.t -> unit
+let load_state_not_found_msg =
+  "WARNING: Load state not found. Restart the Hack server?"

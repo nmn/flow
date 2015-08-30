@@ -8,16 +8,21 @@
  *
  *)
 
+open Core
 
 (*****************************************************************************)
 (* Periodically called by the daemon *)
 (*****************************************************************************)
 
+type callback =
+  | Periodic of (float ref * float * (unit -> unit))
+  | Once of (float ref * (unit -> unit))
+
 module Periodical: sig
+  val always : float
   val one_day: float
   val one_week: float
 
-  (* Called just before going to sleep *)
   val check: unit -> unit
 
   (* register_callback X Y
@@ -26,9 +31,10 @@ module Periodical: sig
    * More or less 1 sec is a more or less what you can expect.
    * More or less 30 secs if the server is busy.
    *)
-  val register_callback: seconds:float -> job:(unit -> unit) -> unit
+  val register_callback: callback -> unit
 
 end = struct
+  let always = 0.0
   let one_day = 86400.0
   let one_week = 604800.0
 
@@ -39,21 +45,26 @@ end = struct
     let current = Unix.time() in
     let delta = current -. !last_call in
     last_call := current;
-    List.iter begin fun (seconds_left, period, job) ->
-      seconds_left := !seconds_left -. delta;
-      if !seconds_left < 0.0
-      then begin
-        seconds_left := period;
-        job()
-      end
-    end !callback_list
+    callback_list := List.filter !callback_list begin fun callback ->
+      (match callback with
+      | Periodic (seconds_left, _, job)
+      | Once (seconds_left, job) ->
+          seconds_left := !seconds_left -. delta;
+          if !seconds_left < 0.0 then job ());
+      (match callback with
+      | Periodic (seconds_left, period, _) ->
+          if !seconds_left < 0.0 then seconds_left := period;
+          true
+      | Once _ -> false);
+    end
 
-  let register_callback ~seconds ~job =
-    callback_list :=
-      (ref seconds, seconds, job) :: !callback_list
+  let register_callback cb =
+    callback_list := cb :: !callback_list
 end
 
-let call_before_sleeping = Periodical.check
+let go = Periodical.check
+
+let async f = Periodical.register_callback (Once (ref 0.0, f))
 
 (*****************************************************************************)
 (*
@@ -78,9 +89,8 @@ let exit_if_unused() =
   let delta: float = Unix.time() -. !last_client_connect in
   if delta > Periodical.one_week
   then begin
-    Printf.fprintf stderr "Exiting server. Last used >7 days ago\n";
-    flush stderr;
-    exit(5)
+    Printf.eprintf "Exiting server. Last used >7 days ago\n";
+    Exit_status.(exit Unused_server)
   end
 
 (*****************************************************************************)
@@ -88,15 +98,18 @@ let exit_if_unused() =
 (*****************************************************************************)
 let init (root : Path.t) =
   let jobs = [
+    Periodical.always   , (fun () -> SharedMem.collect `aggressive);
     Periodical.one_day  , exit_if_unused;
     Periodical.one_day  , Hhi.touch;
     (* try_touch wraps Unix.utimes, which doesn't open/close any fds, so we
      * won't lose our lock by doing this. *)
     Periodical.one_day  , (fun () ->
-      Sys_utils.try_touch (GlobalConfig.lock_file root)
+      Sys_utils.try_touch (ServerFiles.lock_file root)
     );
     Periodical.one_day  , (fun () ->
-      Sys_utils.try_touch (Socket.get_path (GlobalConfig.socket_file root))
+      Sys_utils.try_touch (Socket.get_path (ServerFiles.socket_file root))
     );
   ] in
-  List.iter (fun (period, cb) -> Periodical.register_callback period cb) jobs
+  List.iter jobs begin fun (period, cb) ->
+    Periodical.register_callback (Periodic (ref period, period, cb))
+  end

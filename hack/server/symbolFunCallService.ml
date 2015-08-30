@@ -24,7 +24,8 @@ let combine_name cur_class cur_caller =
   match (!cur_class, !cur_caller) with
   | Some c, Some f -> c^"::"^f
   | None, Some f -> f
-  | _ -> failwith "Why isn't caller set correctly?"
+  (* Top-level function call; shouldn't happen, but just in case *)
+  | _ -> ""
 
 let process_fun_id result_map cur_class cur_caller id =
   let caller_str = combine_name cur_class cur_caller in
@@ -32,7 +33,7 @@ let process_fun_id result_map cur_class cur_caller id =
   result_map := Pos.Map.add pos {
     name = Utils.strip_ns name;
     type_ = Function;
-    pos = SymbolUtils.pos_to_relative pos;
+    pos = Pos.to_relative_string pos;
     caller = caller_str;
   } !result_map
 
@@ -46,7 +47,7 @@ let process_method_id result_map cur_class cur_caller
       result_map := Pos.Map.add pos {
         name = Utils.strip_ns method_fullname;
         type_ = target_type;
-        pos = SymbolUtils.pos_to_relative pos;
+        pos = Pos.to_relative_string pos;
         caller = caller_str;
       } !result_map
   end
@@ -68,7 +69,8 @@ let process_enter_method_def cur_class cur_caller method_def =
 let process_exit_method_def cur_caller _ =
   cur_caller := None
 
-let process_enter_fun_def cur_caller fun_def =
+let process_enter_fun_def cur_class cur_caller fun_def =
+  cur_class := None;
   cur_caller := Some (Utils.strip_ns (snd fun_def.Nast.f_name))
 
 let process_exit_fun_def cur_caller _ =
@@ -92,7 +94,7 @@ let attach_hooks result_map =
     (Some (process_enter_method_def cur_class cur_caller))
     (Some (process_exit_method_def cur_caller));
   Typing_hooks.attach_fun_def_hook
-    (Some (process_enter_fun_def cur_caller))
+    (Some (process_enter_fun_def cur_class cur_caller))
     (Some (process_exit_fun_def cur_caller))
 
 let detach_hooks () =

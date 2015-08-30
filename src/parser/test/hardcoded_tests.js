@@ -1111,19 +1111,24 @@ module.exports = {
   'ES6: Modules': {
     'export class {}': {
       'body.0.declaration': {
-        'type': 'ClassExpression'
+        'type': 'ClassExpression',
       }
     },
     'export default class {}': {
       'body.0.declaration': {
-        'type': 'ClassExpression'
+        'type': 'ClassExpression',
       }
     },
     'export default class A {}': {
       'body.0.declaration': {
-        'type': 'ClassDeclaration'
+        'type': 'ClassDeclaration',
       }
-    }
+    },
+    'export type A = number': {
+      'body.0.declaration': {
+        'type': 'TypeAlias',
+      }
+    },
   },
   'Declare Statements': {
     'declare var foo': {
@@ -1415,6 +1420,26 @@ module.exports = {
       'errors': {
         '0.message': 'Unexpected token <',
       },
+    },
+    '1 + enum': {
+      'errors': {
+        '0.message': 'Unexpected reserved word',
+      }
+    },
+    'enum = 42': {
+      'errors': {
+        '0.message': 'Unexpected reserved word',
+      }
+    },
+    'var enum': {
+      'errors': {
+        '0.message': 'Unexpected reserved word',
+      }
+    },
+    'function hello() { "use strict"; var enum; }': {
+      'errors': {
+        '0.message': 'Unexpected reserved word',
+      }
     },
   },
   'Invalid JSX Syntax': {
@@ -1754,7 +1779,7 @@ module.exports = {
     },
     'declare module A { export default function foo() {} }': {
       'errors': {
-        '0.message': 'Unexpected reserved word',
+        '0.message': 'Unexpected token export',
       }
     },
   },

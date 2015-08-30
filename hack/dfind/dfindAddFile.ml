@@ -12,6 +12,7 @@
 (*****************************************************************************)
 (* Adds a new file or directory to the environment *)
 (*****************************************************************************)
+open Core
 open DfindEnv
 open DfindMaybe
 open Utils
@@ -41,16 +42,18 @@ let get_files path dir_handle =
       if file = "." || file = ".."
       then ()
       else
-        let path = path ^ "/" ^ file in
+        let path =
+          Path.to_string @@
+          Path.concat (Path.expanduser path) file in
         paths := SSet.add path !paths;
     done;
     assert false
   with _ -> !paths
 
-(* Gets rid of the '/' at the end of a directory name *)
+(* Gets rid of the '/' or '\' at the end of a directory name *)
 let normalize path =
   let size = String.length path in
-  if path.[size - 1] = '/'
+  if Char.escaped path.[size - 1] = Filename.dir_sep
   then String.sub path 0 (size - 1)
   else path
 
@@ -76,7 +79,7 @@ module ISet = Set.Make (struct type t = int let compare = compare end)
 (* This used to be an environment variable, but it is too complicated
  * for now. Hardcoding! Yay!
 *)
-let blacklist = List.map Str.regexp [
+let blacklist = List.map ~f:Str.regexp [
   ".*/wiki/images/.*";
   ".*/\\.git";
   ".*/\\.svn";
@@ -85,11 +88,11 @@ let blacklist = List.map Str.regexp [
 
 let is_blacklisted path =
   try
-    List.iter begin fun re ->
+    List.iter blacklist begin fun re ->
       if Str.string_match re path 0
       then raise Exit
       else ()
-    end blacklist;
+    end;
     false
   with Exit -> true
 

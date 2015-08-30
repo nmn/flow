@@ -8,7 +8,7 @@
  *
  *)
 
-
+open Core
 open Utils
 
 module Reason = Typing_reason
@@ -240,7 +240,7 @@ and dependent_type =
   (* Type that is the subtype of the late bound type within a class. *)
   [ `this
   (* The late bound type within a class. It is the type of 'new static()' and
-   * '$this'. This is different than the 'this' type. The 'this' type isn't
+   * '$this'. This is different from the 'this' type. The 'this' type isn't
    * quite strong enough in some cases. It means you are a subtype of the late
    * bound class, but there are instances where you need the exact type.
    * We may not need both since the only way to make something of type 'this'
@@ -404,6 +404,12 @@ type expand_env = {
 
 type ety = expand_env * locl ty
 
+let has_expanded {type_expansions; _} x =
+  List.exists type_expansions begin function
+    | (_, x') when x = x' -> true
+    | _ -> false
+  end
+
 (* The identifier for this *)
 let this = Ident.make "$this"
 
@@ -425,6 +431,7 @@ module AbstractKind = struct
              let display_id = Reason.get_expr_display_id i in
              "<expr#"^string_of_int display_id^">" in
        String.concat "::" (dt::ids)
+
   let is_classname = function
     | AKnewtype (name, _) -> (name = Naming_special_names.Classes.cClassname)
     | AKenum _ -> false
