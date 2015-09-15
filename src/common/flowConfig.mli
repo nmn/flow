@@ -9,8 +9,13 @@
  *)
 type moduleSystem = Node | Haste
 
+type experimental_feature_mode =
+  | EXPERIMENTAL_IGNORE
+  | EXPERIMENTAL_WARN
+
 type options = {
   enable_unsafe_getters_and_setters: bool;
+  experimental_decorators: experimental_feature_mode;
   moduleSystem: moduleSystem;
   module_name_mappers: (Str.regexp * string) list;
   munge_underscores: bool;
@@ -19,6 +24,7 @@ type options = {
   traces: int;
   strip_root: bool;
   log_file: Path.t;
+  max_workers: int;
 }
 
 val default_temp_dir: string

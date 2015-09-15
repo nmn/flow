@@ -97,7 +97,13 @@ let clone_scopes scopes =
 (* TODO will need to walk once LexScopes appear *)
 let in_async_scope () = Scope.(
   match (peek_scope ()).kind with
-  | VarScope { async } -> async
+  | VarScope { async; _ } -> async
+  | _ -> false
+)
+
+let in_generator_scope () = Scope.(
+  match (peek_scope ()).kind with
+  | VarScope { generator; _ } -> generator
   | _ -> false
 )
 
@@ -209,7 +215,7 @@ let global_lexicals = [
    have no process for checking the use of a global binding
    against the kind of binding it turns out to be: this global
    scope is simply a proxy; resolution takes place as a result
-   of the GetT types created in the call to Flow_js.get_builtin.
+   of the GetPropT types created in the call to Flow_js.get_builtin.
 
    This means that we have some false negatives, currently.
    Errors that go unreported currently include:
@@ -221,7 +227,7 @@ let global_lexicals = [
    The least complex solution to this will be to process libs
    eagerly, and save the actual scope to check against here
    when doing local checking of modules. Alternatively, we
-   would have to record in the GetT (or an enrichment) enough
+   would have to record in the GetPropT (or an enrichment) enough
    information about what uses were made of the reference to
    flag such errors on the current deferred basis.
    tests/global_ref tracks this issue.
@@ -325,6 +331,10 @@ let bind_var ?(state=Entry.Declared) cx name t loc =
 let bind_let ?(state=Entry.Undeclared) cx name t loc =
   bind_entry cx name (Entry.new_let t ~loc ~state)
 
+(* bind implicit let entry *)
+let bind_implicit_let ?(state=Entry.Undeclared) implicit cx name t loc =
+  bind_entry cx name (Entry.new_let t ~implicit ~loc ~state)
+
 (* bind const entry *)
 let bind_const ?(state=Entry.Undeclared) cx name t loc =
   bind_entry cx name (Entry.new_const t ~loc ~state)
@@ -387,7 +397,9 @@ let declare_value_entry kind cx name reason =
     already_bound_error cx name entry reason
   )
 
-let declare_let = declare_value_entry Entry.Let
+let declare_let = declare_value_entry (Entry.Let None)
+let declare_implicit_let implicit =
+  declare_value_entry (Entry.Let (Some implicit))
 let declare_const = declare_value_entry Entry.Const
 
 (* Used to adjust state based on whether there is an annotation.
@@ -440,8 +452,10 @@ let init_value_entry kind cx name ~has_anno specific reason =
   Entry.(match kind, entry with
 
   | Var, Value ({ kind = Var; _ } as v)
-  | Let, Value ({ kind = Let; value_state = Undeclared | Declared; _ } as v)
+  | Let _, Value ({ kind = Let _; value_state = Undeclared | Declared; _ } as v)
   | Const, Value ({ kind = Const; value_state = Undeclared | Declared; _ } as v) ->
+    if kind = Var && v.value_state = Initialized
+    then ignore (add_change_var name);
     (* NOTE: causes havocing in some cases, so, reentrant *)
     Flow_js.flow cx (specific, v.general);
     let value_binding = { v with value_state = Initialized; specific } in
@@ -457,7 +471,8 @@ let init_value_entry kind cx name ~has_anno specific reason =
   )
 
 let init_var = init_value_entry Entry.Var
-let init_let = init_value_entry Entry.Let
+let init_let = init_value_entry (Entry.Let None)
+let init_implicit_let implicit = init_value_entry (Entry.Let (Some implicit))
 let init_const = init_value_entry Entry.Const
 
 (* update type alias to reflect initialization in code *)
@@ -487,7 +502,7 @@ let pseudo_init_declared_type cx name reason =
 let value_entry_types ~lookup_mode cx name reason entry scope =
   Entry.(match entry with
 
-  | Value { kind = Let | Const; value_state = Undeclared; _ }
+  | Value { kind = Let _ | Const; value_state = Undeclared; _ }
       when lookup_mode = ForValue
       && scope = peek_scope () (* see comment header *)
       ->
@@ -562,7 +577,7 @@ let set_var cx name specific reason =
   let scope, entry = find_entry cx name reason in
   Entry.(match entry with
 
-  | Value ({ kind = Let | Var; _ } as v) ->
+  | Value ({ kind = Let _ | Var; _ } as v) ->
     ignore (add_change_var name);
     (* NOTE: causes havocing in some cases, so, reentrant *)
     Flow_js.flow cx (specific, v.general);
@@ -658,7 +673,20 @@ let merge_env =
         (* ...in which case we can forget them *)
         ()
       (* otherwise, non-refinement uneven distributions are asserts. *)
-      | orig, child1, child2 ->
+      (* TODO:
+         Asserting on all uneven distributions is too strict for now.
+         let_env can interact with path-dependent refinement to leave
+         residual entries in child contexts, when catch blocks combine
+         conditionals and early returns.
+         So for now we need to let extra child entries pass, though we
+         should still assert on extra parent entries.
+         Once let/const/LexScope is in place, we can reimplement let_env
+         in terms of those constructs instead, and the full assert can
+         be reinstated.
+       *)
+      | None, _, _ ->
+        ()
+      | Some _ as orig, child1, child2 ->
         let print_entry_kind_opt = function
         | None -> "None"
         | Some e -> spf "Some %s" (string_of_kind e)
@@ -674,6 +702,7 @@ let merge_env =
       assert_false (spf
         "merge_entry %s: ragged scope lists"
         (string_of_reason reason))
+
   ) in
 
   (* merge a refis bound to key if present. handle uneven distributions.
@@ -759,7 +788,6 @@ let copy_env  = Entry.(
         "copy_env %s: malformed scope lists"
         (string_of_reason reason))
 
-
   in
 
   (* look for and copy refinement in top scope only *)
@@ -827,6 +855,10 @@ let widen_env =
       top_scope |> Scope.update_refis (fun key refi ->
         widen_refi cx reason (Key.string_of_key key) refi)
 
+(* TODO this is legacy, used to simulate lexical scoping.
+   Called from catch block traversal only. Should replace
+   with a LexScope. Also, see TODO in merge_env for correlated
+   change there *)
 (* run passed function with given entry added to scope *)
 (* CAUTION: caller must ensure that name isn't already bound,
    otherwise this will remove the preexisting binding *)

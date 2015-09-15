@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -91,6 +91,17 @@ let exec_read cmd =
   let result = input_line ic in
   assert (Unix.close_process_in ic = Unix.WEXITED 0);
   result
+
+let exec_read_lines ?(reverse=false) cmd =
+  let ic = Unix.open_process_in cmd in
+  let result = ref [] in
+  (try
+    while true do
+      result := input_line ic :: !result
+    done;
+  with End_of_file -> ());
+  assert (Unix.close_process_in ic = Unix.WEXITED 0);
+  if not reverse then List.rev !result else !result
 
 let restart () =
   let cmd = Sys.argv.(0) in
@@ -263,8 +274,14 @@ let append_file ~file s =
 let filemtime file =
   (Unix.stat file).Unix.st_mtime
 
-let try_touch file =
-  try Unix.utimes file 0.0 0.0 with _ -> ()
+external lutimes : string -> unit = "hh_lutimes"
+
+let try_touch ~follow_symlinks file =
+  try
+    if follow_symlinks then Unix.utimes file 0.0 0.0
+    else lutimes file
+  with _ ->
+    ()
 
 (* Emulate "mkdir -p", i.e., no error if already exists. *)
 let mkdir_no_fail dir =
@@ -302,3 +319,11 @@ let symlink =
 let setsid =
   (* Not implemented on Windows. Let's just return the pid *)
   if Sys.win32 then Unix.getpid else Unix.setsid
+
+let set_signal = if not Sys.win32 then Sys.set_signal else (fun _ _ -> ())
+
+external get_total_ram : unit -> int = "hh_sysinfo_totalram"
+external nproc: unit -> int = "nproc"
+
+let total_ram = get_total_ram ()
+let nbr_procs = nproc ()

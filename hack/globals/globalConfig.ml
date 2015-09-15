@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -13,8 +13,7 @@
 (* Configuration file *)
 (*****************************************************************************)
 
-external nproc: unit -> int = "nproc"
-let nbr_procs = nproc ()
+let nbr_procs = Sys_utils.nbr_procs
 
 let freq_cache_capacity = 1000
 let ordered_cache_capacity = 1000

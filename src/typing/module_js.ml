@@ -32,7 +32,6 @@ type info = {
   _module: string;          (* module name *)
   required: SSet.t;         (* required module names *)
   require_loc: Loc.t SMap.t;  (* statement locations *)
-  strict_required: SSet.t;  (* strict requires (flow to export types) *)
   checked: bool;            (* in flow? *)
   parsed: bool;             (* if false, it's a tracking record only *)
 }
@@ -250,8 +249,10 @@ module Node = struct
   let guess_exported_module file _content = file
 
   let path_if_exists path =
-    if file_exists path then Some path
-    else None
+    if not (file_exists path) ||
+      FlowConfig.(is_excluded (get_unsafe ()) path)
+    then None
+    else Some path
 
   let path_is_file path =
     file_exists path && not (Sys.is_directory path)
@@ -593,7 +594,6 @@ let info_of cx = {
   _module = cx.Constraint._module;
   required = cx.Constraint.required;
   require_loc = cx.Constraint.require_loc;
-  strict_required = cx.Constraint.strict_required;
   checked = cx.Constraint.checked;
   parsed = true;
 }
@@ -619,7 +619,6 @@ let add_unparsed_info file =
   let info = { file; _module; checked; parsed = false;
     required = SSet.empty;
     require_loc = SMap.empty;
-    strict_required = SSet.empty;
   } in
   InfoHeap.add file info
 

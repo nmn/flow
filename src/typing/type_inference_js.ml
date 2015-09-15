@@ -221,9 +221,6 @@ let mark_exports_type cx reason new_exports_type = (
   cx.module_exports_type <- new_exports_type
 )
 
-let lookup_module cx m =
-  SMap.find_unsafe m cx.modulemap
-
 (**
  * Given an exported default declaration, identify nameless declarations and
  * name them with a special internal name that can be used to reference them
@@ -300,15 +297,15 @@ let rec extract_destructured_bindings accum pattern = Ast.Pattern.(
 
 let rec destructuring cx t f = Ast.Pattern.(function
   | loc, Array { Array.elements; _; } -> Array.(
-      let reason = mk_reason "array pattern" loc in
       elements |> List.iteri (fun i -> function
         | Some (Element ((loc, _) as p)) ->
-            let i = NumT (
+            let key = NumT (
               mk_reason "number" loc,
               Literal (float i, string_of_int i)
             ) in
+            let reason = mk_reason (spf "element %d" i) loc in
             let tvar = Flow_js.mk_tvar cx reason in
-            Flow_js.flow cx (t, GetElemT(reason,i,tvar));
+            Flow_js.flow cx (t, GetElemT(reason, key, tvar));
             destructuring cx tvar f p
         | Some (Spread (loc, { SpreadElement.argument })) ->
             error_destructuring cx loc
@@ -324,13 +321,13 @@ let rec destructuring cx t f = Ast.Pattern.(function
             match prop with
             | { key = Identifier (loc, id); pattern = p; } ->
                 let x = id.Ast.Identifier.name in
-                let reason = mk_reason (spf "property %s" x) loc in
+                let reason = mk_reason (spf "property `%s`" x) loc in
                 xs := x :: !xs;
                 let tvar = Flow_js.mk_tvar cx reason in
                 (* use the same reason for the prop name and the lookup.
                    given `var {foo} = ...`, `foo` is both. compare to `a.foo`
                    where `foo` is the name and `a.foo` is the lookup. *)
-                Flow_js.flow cx (t, GetT(reason, (reason, x), tvar));
+                Flow_js.flow cx (t, GetPropT(reason, (reason, x), tvar));
                 destructuring cx tvar f p
             | _ ->
               error_destructuring cx loc
@@ -569,6 +566,30 @@ let are_getters_and_setters_enabled () = FlowConfig.(
   config.options.enable_unsafe_getters_and_setters
 )
 
+let are_decorators_enabled () = FlowConfig.(
+  let config = get_unsafe () in
+  config.options.experimental_decorators
+)
+
+let warn_or_ignore_decorators cx decorators_list = FlowConfig.(
+  if decorators_list = [] then () else
+  match (get_unsafe ()).options.experimental_decorators with
+  | EXPERIMENTAL_IGNORE -> ()
+  | EXPERIMENTAL_WARN ->
+      let first_loc = fst (List.hd decorators_list) in
+      let last_loc =
+        fst (List.nth decorators_list ((List.length decorators_list) - 1))
+      in
+      let loc = Loc.btwn first_loc last_loc in
+      let reason = mk_reason "Experimental decorator usage" loc in
+      Flow_js.add_warning cx [
+        reason,
+        "Decorators are an early stage proposal that may change. " ^
+        "Additionally, Flow does not account for the type implications of " ^
+        "decorators at this time."
+      ]
+)
+
 (**********************************)
 (* Transform annotations to types *)
 (**********************************)
@@ -649,7 +670,7 @@ let rec convert cx type_params_map = Ast.Type.(function
     let _, { Ast.Identifier.name; _ } = id in
     let reason = mk_reason name loc in
     let t = Flow_js.mk_tvar_where cx reason (fun t ->
-      Flow_js.flow cx (m, GetT (reason, (reason, name), t));
+      Flow_js.flow cx (m, GetPropT (reason, (reason, name), t));
     ) in
     let typeParameters = extract_type_param_instantiations typeParameters in
     let params = if typeParameters = []
@@ -798,7 +819,6 @@ let rec convert cx type_params_map = Ast.Type.(function
         mk_nominal_type cx reason type_params_map (c, params)
     )
 
-  (* TODO: unsupported generators *)
   | loc, Function { Function.params; returnType; rest; typeParameters } ->
     let typeparams, type_params_map =
       mk_type_param_declarations cx type_params_map typeParameters in
@@ -920,7 +940,7 @@ and convert_qualification ?(lookup_mode=ForType) cx reason_prefix
     let _, { Ast.Identifier.name; _ } = id in
     let reason = mk_reason (spf "%s '<<object>>.%s')" reason_prefix name) loc in
     Flow_js.mk_tvar_where cx reason (fun t ->
-      Flow_js.flow cx (m, GetT (reason, (reason, name), t));
+      Flow_js.flow cx (m, GetPropT (reason, (reason, name), t));
     )
 
   | Unqualified (id) ->
@@ -930,8 +950,12 @@ and convert_qualification ?(lookup_mode=ForType) cx reason_prefix
 )
 
 and mk_rest cx = function
-  | ArrT(_, t, []) -> RestT t
+  | ArrT (_, t, []) -> RestT t
   | AnyT _ as t -> RestT t
+  | ArrT (r, t, _) ->
+      let msg = "rest parameters should be an array type, got a tuple type instead" in
+      Flow_js.add_warning cx [r,msg];
+      RestT t
   | t ->
       (* unify t with Array<e>, return (RestT e) *)
       let reason = prefix_reason "element of " (reason_of_t t) in
@@ -1050,10 +1074,10 @@ and statement_decl cx type_params_map = Ast.Statement.(
       ()
   | (loc, DeclareTypeAlias { TypeAlias.id; typeParameters; right; } )
   | (loc, TypeAlias { TypeAlias.id; typeParameters; right; } ) ->
-      let _, { Ast.Identifier.name; _ } = id in
-      let r = mk_reason (spf "type %s" name) loc in
+      let name_loc, { Ast.Identifier.name; _ } = id in
+      let r = mk_reason (spf "type %s" name) name_loc in
       let tvar = Flow_js.mk_tvar cx r in
-      Env_js.bind_type cx name tvar loc
+      Env_js.bind_type cx name tvar name_loc
 
   | (loc, Switch { Switch.discriminant; cases; lexical }) ->
       (* TODO: ensure that default is last *)
@@ -1155,7 +1179,7 @@ and statement_decl cx type_params_map = Ast.Statement.(
         let name_loc, { Ast.Identifier.name; _ } = id in
         let r = mk_reason (spf "class %s" name) name_loc in
         let tvar = Flow_js.mk_tvar cx r in
-        Env_js.bind_let cx name tvar name_loc
+        Env_js.bind_implicit_let Scope.Entry.ClassNameBinding cx name tvar name_loc
       | None -> ()
     )
 
@@ -1482,8 +1506,8 @@ and statement cx type_params_map = Ast.Statement.(
       ()
   | (loc, DeclareTypeAlias { TypeAlias.id; typeParameters; right; } )
   | (loc, TypeAlias { TypeAlias.id; typeParameters; right; } ) ->
-      let _, { Ast.Identifier.name; _ } = id in
-      let r = mk_reason (spf "type %s" name) loc in
+      let name_loc, { Ast.Identifier.name; _ } = id in
+      let r = mk_reason (spf "type %s" name) name_loc in
       let typeparams, type_params_map =
         mk_type_param_declarations cx type_params_map typeParameters in
       let t = convert cx type_params_map right in
@@ -1594,18 +1618,26 @@ and statement cx type_params_map = Ast.Statement.(
         | None -> void_ loc
         | Some expr -> expression cx type_params_map expr
       in
-      (* if we're in an async function, convert the return
-         expression's type T to Promise<T> *)
-      let t = if Env_js.in_async_scope ()
-        then
-          (* Unwrap and wrap t with a Promise by returning whatever
-             Promise.resolve(t) returns. *)
+      let t =
+        if Env_js.in_async_scope () then
+          (* Convert the return expression's type T to Promise<T>. If the
+           * expression type is itself a Promise<T>, ensure we still return
+           * a Promise<T> via Promise.resolve. *)
           let reason = mk_reason "async return" loc in
           let promise = Env_js.get_var cx "Promise" reason in
           Flow_js.mk_tvar_where cx reason (fun tvar ->
             let call = Flow_js.mk_methodtype promise [t] tvar in
             Flow_js.flow cx (promise, MethodT (reason, "resolve", call))
           )
+        else if Env_js.in_generator_scope () then
+          (* Convert the return expression's type R to Generator<Y,R,N>, where
+           * Y and R are internals, installed earlier. *)
+          let reason = mk_reason "generator return" loc in
+          Flow_js.get_builtin_typeapp cx reason "Generator" [
+            Env_js.get_var cx (internal_name "yield") reason;
+            t;
+            Env_js.get_var cx (internal_name "next") reason
+          ]
         else t
       in
       Flow_js.flow cx (t, ret);
@@ -1991,8 +2023,8 @@ and statement cx type_params_map = Ast.Statement.(
       let o = Flow_js.get_builtin_typeapp
         cx
         (mk_reason "iteration expected on Iterable" loc)
-        "Iterable"
-        [element_tvar] in
+        "$Iterable"
+        [element_tvar; AnyT.at loc; AnyT.at loc] in
 
       Flow_js.flow cx (t, o); (* null/undefined are NOT allowed *)
 
@@ -2046,11 +2078,11 @@ and statement cx type_params_map = Ast.Statement.(
   | (loc, Debugger) ->
       ()
 
-  (* TODO: unsupported generators *)
   | (loc, FunctionDeclaration {
       FunctionDeclaration.id;
       params; defaults; rest;
       body;
+      generator;
       returnType;
       typeParameters;
       async;
@@ -2058,10 +2090,31 @@ and statement cx type_params_map = Ast.Statement.(
     }) ->
       let reason = mk_reason "function" loc in
       let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
-      let fn_type = mk_function None cx type_params_map reason  ~async
+      let fn_type = mk_function None cx type_params_map reason  ~async ~generator
         typeParameters (params, defaults, rest) returnType body this
       in
-      Hashtbl.replace cx.type_table loc fn_type;
+
+      (**
+       * Use the loc for the function name in the types table. When the function
+       * has no name (i.e. for `export default function() ...`), generate a loc
+       * that will span the `function` keyword as a next-best-thing location.
+       *)
+      let type_table_loc =
+        match id with
+        | Some (loc, _) -> loc
+        | None -> Loc.({
+            source = loc.source;
+            start = loc.start;
+            _end = {
+              line = loc.start.line;
+
+              (* len('function') is 8 *)
+              column = loc.start.column + 8;
+              offset = loc.start.offset + 8;
+            };
+          })
+      in
+      Hashtbl.replace cx.type_table type_table_loc fn_type;
       (match id with
       | Some(_, {Ast.Identifier.name; _ }) ->
         Env_js.init_var cx name ~has_anno:false fn_type reason
@@ -2076,10 +2129,16 @@ and statement cx type_params_map = Ast.Statement.(
   | (class_loc, ClassDeclaration c) ->
       let (name_loc, name) = extract_class_name class_loc c in
       let reason = mk_reason name name_loc in
-      Env_js.declare_let cx name reason;
+      Env_js.declare_implicit_let Scope.Entry.ClassNameBinding cx name reason;
       let cls_type = mk_class cx type_params_map class_loc reason c in
       Hashtbl.replace cx.type_table class_loc cls_type;
-      Env_js.init_let cx name ~has_anno:false cls_type reason
+      Env_js.init_implicit_let
+        Scope.Entry.ClassNameBinding
+        cx
+        name
+        ~has_anno:false
+        cls_type
+        reason
 
   | (loc, DeclareClass {
       Interface.id;
@@ -2108,7 +2167,12 @@ and statement cx type_params_map = Ast.Statement.(
 
     let sfmap, smmap, fmap, mmap = List.fold_left Ast.Type.Object.Property.(
       fun (sfmap_, smmap_, fmap_, mmap_)
-        (loc, { key; value; static; _method; _ }) -> (* TODO: optional *)
+        (loc, { key; value; static; _method; optional; }) ->
+        if optional && _method
+        then begin
+          let msg = "optional methods are not supported" in
+          Flow_js.add_error cx [Reason_js.mk_reason "" loc, msg]
+        end;
         Ast.Expression.Object.Property.(match key with
         | Literal (loc, _)
         | Computed (loc, _) ->
@@ -2118,8 +2182,10 @@ and statement cx type_params_map = Ast.Statement.(
 
         | Identifier (loc, { Ast.Identifier.name; _ }) ->
             let t = convert cx type_params_map value in
+            let t = if optional then OptionalT t else t in
             (* check for overloads in static and instance method maps *)
             let map_ = if static then smmap_ else mmap_ in
+
             let t = match SMap.get name map_ with
               | None -> t
               | Some (IntersectionT (reason, seen_ts)) ->
@@ -2394,7 +2460,7 @@ and statement cx type_params_map = Ast.Statement.(
               match source_module_tvar with
               | Some(tvar) ->
                 Flow_js.mk_tvar_where cx reason (fun t ->
-                  Flow_js.flow cx (tvar, GetT(reason, (reason, local_name), t))
+                  Flow_js.flow cx (tvar, GetPropT(reason, (reason, local_name), t))
                 )
               | None ->
                 Env_js.var_ref ~lookup_mode cx local_name reason
@@ -2503,7 +2569,7 @@ and statement cx type_params_map = Ast.Statement.(
         let remote_t = Flow_js.mk_tvar_where cx get_reason (fun t ->
           Flow_js.flow cx (
             module_ns_tvar,
-            GetT(get_reason, (get_reason, remote_export_name), t)
+            GetPropT(get_reason, (get_reason, remote_export_name), t)
           )
         ) in
 
@@ -2650,11 +2716,11 @@ and object_prop cx type_params_map map = Ast.Expression.Object.(function
                      _ }) ->
       Ast.Expression.Function.(
         let { params; defaults; rest; body;
-              returnType; typeParameters; id; async; _ } = func
+              returnType; typeParameters; id; async; generator; _ } = func
         in
         let reason = mk_reason "function" vloc in
         let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
-        let ft = mk_function id cx type_params_map ~async reason typeParameters
+        let ft = mk_function id cx type_params_map ~async ~generator reason typeParameters
           (params, defaults, rest) returnType body this
         in
         Hashtbl.replace cx.type_table vloc ft;
@@ -2704,7 +2770,7 @@ and object_prop cx type_params_map map = Ast.Expression.Object.(function
       let { body; returnType; _ } = func in
       let reason = mk_reason "getter function" vloc in
       let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
-      let function_type = mk_function None cx type_params_map ~async:false reason None
+      let function_type = mk_function None cx type_params_map ~async:false ~generator:false reason None
         ([], [], None) returnType body this
       in
       let return_t = extract_getter_type function_type in
@@ -2729,7 +2795,7 @@ and object_prop cx type_params_map map = Ast.Expression.Object.(function
       let { params; defaults; body; returnType; _ } = func in
       let reason = mk_reason "setter function" vloc in
       let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
-      let function_type = mk_function None cx type_params_map ~async:false reason None
+      let function_type = mk_function None cx type_params_map ~async:false ~generator:false reason None
         (params, defaults, None) returnType body this
       in
       let param_t = extract_setter_type function_type in
@@ -2804,7 +2870,7 @@ and variable cx type_params_map (loc, vdecl) = Ast.(
               Flow_js.flow cx (t, t_);
               destructuring_assignment cx t_ id
           | None ->
-              ()
+              failwith "Parser Error: Destructuring assignment should always be init."
         )
 )
 
@@ -2955,11 +3021,11 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
         { Ast.Identifier.name; _ });
       _
     } ->
-      let expr_reason = mk_reason (spf "property %s" name) loc in
+      let expr_reason = mk_reason (spf "property `%s`" name) loc in
       (match Refinement.get cx (loc, e) expr_reason with
       | Some t -> t
       | None ->
-        let prop_reason = mk_reason (spf "property %s" name) ploc in
+        let prop_reason = mk_reason (spf "property `%s`" name) ploc in
 
         (* TODO: shouldn't this be `mk_reason "super" super_loc`? *)
         let super = super_ cx expr_reason in
@@ -2969,7 +3035,7 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
         else (
           Flow_js.mk_tvar_where cx expr_reason (fun tvar ->
             Flow_js.flow cx (
-              super, GetT(expr_reason, (prop_reason, name), tvar)
+              super, GetPropT(expr_reason, (prop_reason, name), tvar)
             )
           )
         )
@@ -2980,11 +3046,11 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
       property = Member.PropertyIdentifier (ploc, { Ast.Identifier.name; _ });
       _
     } -> (
-      let expr_reason = mk_reason (spf "property %s" name) loc in
+      let expr_reason = mk_reason (spf "property `%s`" name) loc in
       match Refinement.get cx (loc, e) expr_reason with
       | Some t -> t
       | None ->
-        let prop_reason = mk_reason (spf "property %s" name) ploc in
+        let prop_reason = mk_reason (spf "property `%s`" name) ploc in
         let tobj = expression cx type_params_map _object in
         if Type_inference_hooks_js.dispatch_member_hook cx name ploc tobj
         then AnyT.at ploc
@@ -3374,6 +3440,7 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
       params; defaults; rest;
       body;
       async;
+      generator;
       returnType;
       typeParameters;
       _
@@ -3381,10 +3448,9 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
       let desc = (if async then "async " else "") ^ "function" in
       let reason = mk_reason desc loc in
       let this = Flow_js.mk_tvar cx (replace_reason "this" reason) in
-      mk_function id cx type_params_map reason ~async
+      mk_function id cx type_params_map reason ~async ~generator
         typeParameters (params, defaults, rest) returnType body this
 
-  (* TODO: unsupported generators *)
   | ArrowFunction {
       ArrowFunction.id;
       params; defaults; rest;
@@ -3398,7 +3464,7 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
       let reason = mk_reason desc loc in
       let this = this_ cx reason in
       let super = super_ cx reason in
-      mk_arrow id cx type_params_map reason ~async
+      mk_arrow id cx type_params_map reason ~async ~generator:false
         typeParameters (params, defaults, rest) returnType body this super
 
   | TaggedTemplate {
@@ -3445,7 +3511,10 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
           let tvar = Flow_js.mk_tvar cx reason in
           let scope = Scope.fresh () in
           Scope.(
-            let entry = Entry.(new_let tvar ~loc:name_loc ~state:Declared) in
+            let implicit = Entry.ClassNameBinding in
+            let entry = Entry.(
+              new_let tvar ~loc:name_loc ~state:Declared ~implicit
+            ) in
             add_entry name entry scope
           );
           Env_js.push_env cx scope;
@@ -3455,8 +3524,37 @@ and expression_ ~is_cond cx type_params_map loc e = Ast.Expression.(match e with
           class_t;
       | None -> mk_class cx type_params_map loc reason c)
 
+  | Yield { Yield.argument; delegate = false } ->
+      let reason = mk_reason "yield" loc in
+      let yield = Env_js.get_var cx (internal_name "yield") reason in
+      let t = expression cx type_params_map argument in
+      Flow_js.flow cx (t, yield);
+      let next = Env_js.get_var cx (internal_name "next") reason in
+      OptionalT next
+
+  | Yield { Yield.argument; delegate = true } ->
+      let reason = mk_reason "yield* delegate" loc in
+      let next = Env_js.get_var cx
+        (internal_name "next")
+        (prefix_reason "next of parent generator in " reason) in
+      let yield = Env_js.get_var cx
+        (internal_name "yield")
+        (prefix_reason "yield of parent generator in " reason) in
+      let t = expression cx type_params_map argument in
+
+      let ret = Flow_js.mk_tvar cx
+        (prefix_reason "return of child generator in " reason) in
+
+      (* widen yield with the element type of the delegated-to iterable *)
+      let iterable = Flow_js.get_builtin_typeapp cx
+        (mk_reason "iteration expected on Iterable" loc)
+        "$Iterable"
+        [yield; ret; next] in
+      Flow_js.flow cx (t, iterable);
+
+      ret
+
   (* TODO *)
-  | Yield _
   | Comprehension _
   | Generator _
   | Let _ ->
@@ -3484,32 +3582,10 @@ and func_call cx reason func_t argts =
     Flow_js.flow cx (func_t, CallT(reason, app))
   )
 
-and reflective s =
-  (* could be stricter *)
-  List.mem s [
-    "propertyIsEnumerable";
-    "length";
-    "isPrototypeOf";
-    "hasOwnProperty";
-    "constructor";
-    "valueOf";
-    "toString";
-    "toLocaleString";
-  ]
-
-and non_identifier s =
-  (* should be stricter *)
-  Str.string_match (Str.regexp ".* ") s 0
-
 (* traverse a literal expression, return result type *)
 and literal cx loc lit = Ast.Literal.(match lit.value with
   | String s ->
-    let lit =
-      if reflective s || non_identifier s
-      then AnyLiteral
-      else Literal s
-    in
-      StrT (mk_reason "string" loc, lit)
+      StrT (mk_reason "string" loc, Literal s)
 
   | Boolean b ->
       BoolT (mk_reason "boolean" loc, Some b)
@@ -3705,10 +3781,10 @@ and assignment cx type_params_map loc = Ast.Expression.(function
             _
           }) ->
             let reason =
-              mk_reason (spf "assignment of property %s" name) lhs_loc in
-            let prop_reason = mk_reason (spf "property %s" name) ploc in
+              mk_reason (spf "assignment of property `%s`" name) lhs_loc in
+            let prop_reason = mk_reason (spf "property `%s`" name) ploc in
             let super = super_ cx reason in
-            Flow_js.flow cx (super, SetT(reason, (prop_reason, name), t))
+            Flow_js.flow cx (super, SetPropT(reason, (prop_reason, name), t))
 
         (* _object.name = e *)
         | lhs_loc, Ast.Pattern.Expression ((_, Member {
@@ -3722,11 +3798,11 @@ and assignment cx type_params_map loc = Ast.Expression.(function
             if not (Type_inference_hooks_js.dispatch_member_hook cx name ploc o)
             then (
               let reason = mk_reason
-                (spf "assignment of property %s" name) lhs_loc in
-              let prop_reason = mk_reason (spf "property %s" name) ploc in
+                (spf "assignment of property `%s`" name) lhs_loc in
+              let prop_reason = mk_reason (spf "property `%s`" name) ploc in
 
               (* flow type to object property itself *)
-              Flow_js.flow cx (o, SetT (reason, (prop_reason, name), t));
+              Flow_js.flow cx (o, SetPropT (reason, (prop_reason, name), t));
 
               (* types involved in the assignment are computed
                  in pre-havoc environment. it's the assignment itself
@@ -4251,7 +4327,7 @@ and react_create_class cx type_params_map loc class_props = Ast.Expression.(
             returnType; typeParameters; _ } = func
           in
           let reason = mk_reason "defaultProps" vloc in
-          let t = mk_method cx type_params_map reason ~async:false (params, defaults, rest)
+          let t = mk_method cx type_params_map reason ~async:false ~generator:false (params, defaults, rest)
             returnType body this (MixedT reason)
           in
           (match t with
@@ -4272,7 +4348,7 @@ and react_create_class cx type_params_map loc class_props = Ast.Expression.(
             returnType; typeParameters; _ } = func
           in
           let reason = mk_reason "initialState" vloc in
-          let t = mk_method cx type_params_map reason ~async:false (params, defaults, rest)
+          let t = mk_method cx type_params_map reason ~async:false ~generator:false (params, defaults, rest)
             returnType body this (MixedT reason)
           in
           let override_state =
@@ -4292,10 +4368,10 @@ and react_create_class cx type_params_map loc class_props = Ast.Expression.(
           _ }) ->
         Ast.Expression.Function.(
           let { params; defaults; rest; body;
-            returnType; typeParameters; async; _ } = func
+            returnType; typeParameters; async; generator; _ } = func
           in
           let reason = mk_reason "function" vloc in
-          let t = mk_method cx type_params_map reason ~async (params, defaults, rest)
+          let t = mk_method cx type_params_map reason ~async ~generator (params, defaults, rest)
             returnType body this (MixedT reason)
           in
           fmap, SMap.add name t mmap
@@ -4341,7 +4417,7 @@ and react_create_class cx type_params_map loc class_props = Ast.Expression.(
       static_reason smap (MixedT static_reason)
   in
   let super_static = Flow_js.mk_tvar_where cx static_reason (fun t ->
-    Flow_js.flow cx (super, GetT(static_reason, (static_reason, "statics"), t));
+    Flow_js.flow cx (super, GetPropT(static_reason, (static_reason, "statics"), t));
   ) in
   Flow_js.flow cx (super_static, override_statics);
   static := clone_object cx static_reason !static super_static;
@@ -4763,7 +4839,7 @@ and get_prop ~is_cond cx reason tobj (prop_reason, name) =
     let get_prop_u =
       if is_cond
       then LookupT (reason, None, name, LowerBoundT t)
-      else GetT (reason, (prop_reason, name), t)
+      else GetPropT (reason, (prop_reason, name), t)
     in
     Flow_js.flow cx (tobj, get_prop_u)
   )
@@ -4783,7 +4859,7 @@ and static_method_call_Object cx type_params_map loc m args_ = Ast.Expression.(
     let map = pmap |> SMap.mapi (fun x spec ->
       let reason = prefix_reason (spf ".%s of " x) reason in
       Flow_js.mk_tvar_where cx reason (fun tvar ->
-        Flow_js.flow cx (spec, GetT(reason, (reason, "value"), tvar));
+        Flow_js.flow cx (spec, GetPropT(reason, (reason, "value"), tvar));
       )
     ) in
     Flow_js.mk_object_with_map_proto cx reason map proto
@@ -4791,7 +4867,7 @@ and static_method_call_Object cx type_params_map loc m args_ = Ast.Expression.(
   | ("getPrototypeOf", [ Expression e ]) ->
     let o = expression cx type_params_map e in
     Flow_js.mk_tvar_where cx reason (fun tvar ->
-      Flow_js.flow cx (o, GetT(reason, (reason, "__proto__"), tvar));
+      Flow_js.flow cx (o, GetPropT(reason, (reason, "__proto__"), tvar));
     )
 
   | (("getOwnPropertyNames" | "keys"), [ Expression e ]) ->
@@ -4810,9 +4886,9 @@ and static_method_call_Object cx type_params_map loc m args_ = Ast.Expression.(
     let o = expression cx type_params_map e in
     let spec = expression cx type_params_map config in
     let tvar = Flow_js.mk_tvar cx reason in
-    let prop_reason = mk_reason (spf "property %s" x) ploc in
-    Flow_js.flow cx (spec, GetT(reason, (reason, "value"), tvar));
-    Flow_js.flow cx (o, SetT (reason, (prop_reason, x), tvar));
+    let prop_reason = mk_reason (spf "property `%s`" x) ploc in
+    Flow_js.flow cx (spec, GetPropT(reason, (reason, "value"), tvar));
+    Flow_js.flow cx (o, SetPropT (reason, (prop_reason, x), tvar));
     o
 
   | ("defineProperties", [ Expression e;
@@ -4822,8 +4898,8 @@ and static_method_call_Object cx type_params_map loc m args_ = Ast.Expression.(
     pmap |> SMap.iter (fun x spec ->
       let reason = prefix_reason (spf ".%s of " x) reason in
       let tvar = Flow_js.mk_tvar cx reason in
-      Flow_js.flow cx (spec, GetT(reason, (reason, "value"), tvar));
-      Flow_js.flow cx (o, SetT (reason, (reason, x), tvar));
+      Flow_js.flow cx (spec, GetPropT(reason, (reason, "value"), tvar));
+      Flow_js.flow cx (o, SetPropT (reason, (reason, x), tvar));
     );
     o
 
@@ -4924,7 +5000,10 @@ and mk_signature cx reason_c type_params_map superClass body = Ast.Class.(
           returnType; typeParameters; body; _ };
         kind;
         static;
+        decorators;
       }) ->
+
+      warn_or_ignore_decorators cx decorators;
 
       (match kind with
       | Method.Get | Method.Set when not (are_getters_and_setters_enabled ()) ->
@@ -5014,7 +5093,7 @@ and mk_signature cx reason_c type_params_map superClass body = Ast.Class.(
           let msg = "class property initializers are not yet supported" in
           Flow_js.add_error cx [mk_reason "" loc, msg]
         end;
-        let r = mk_reason (spf "class property %s" name) loc in
+        let r = mk_reason (spf "class property `%s`" name) loc in
         let t = mk_type_annotation cx type_params_map r typeAnnotation in
         if static
         then
@@ -5082,10 +5161,14 @@ and mk_class_elements cx instance_info static_info body = Ast.Class.(
         Method.key = Ast.Expression.Object.Property.Identifier (_,
           { Ast.Identifier.name; _ });
         value = _, { Ast.Expression.Function.params; defaults; rest;
-          returnType; typeParameters; body; async; _ };
+          returnType; typeParameters; body; async; generator; _ };
         static;
         kind;
+        decorators;
       }) ->
+
+      warn_or_ignore_decorators cx decorators;
+
       let this, super, method_sigs, getter_sigs, setter_sigs =
         if static then static_info else instance_info
       in
@@ -5100,6 +5183,14 @@ and mk_class_elements cx instance_info static_info body = Ast.Class.(
            (_, _, ret, param_types_map, param_loc_map) =
         SMap.find_unsafe name sigs_to_use in
 
+      let yield, next = if generator then (
+        Flow_js.mk_tvar cx (prefix_reason "yield of " reason),
+        Flow_js.mk_tvar cx (prefix_reason "next of " reason)
+      ) else (
+        MixedT (replace_reason "no yield" reason),
+        MixedT (replace_reason "no next" reason)
+      ) in
+
       let save_return_exn = Abnormal.swap Abnormal.Return false in
       let save_throw_exn = Abnormal.swap Abnormal.Throw false in
       Flow_js.generate_tests cx reason typeparams (fun map_ ->
@@ -5113,8 +5204,8 @@ and mk_class_elements cx instance_info static_info body = Ast.Class.(
           | MixedT _ -> false
           | _ -> name = "constructor"
         in
-        mk_body None cx type_params_map ~async ~derived_ctor
-          param_types_map param_loc_map ret body this super;
+        mk_body None cx type_params_map ~async ~generator ~derived_ctor
+          param_types_map param_loc_map ret body this super yield next;
       );
       ignore (Abnormal.swap Abnormal.Return save_return_exn);
       ignore (Abnormal.swap Abnormal.Throw save_throw_exn)
@@ -5467,7 +5558,7 @@ and mk_interface cx reason_i typeparams type_params_map
    signature consisting of type parameters, parameter types, parameter names,
    and return type, check the body against that signature by adding `this` and
    `super` to the environment, and return the signature. *)
-and function_decl id cx type_params_map (reason:reason) ~async
+and function_decl id cx type_params_map (reason:reason) ~async ~generator
   type_params params ret body this super =
 
   let typeparams, type_params_map =
@@ -5475,6 +5566,14 @@ and function_decl id cx type_params_map (reason:reason) ~async
 
   let (params, pnames, ret, param_types_map, param_types_loc) =
     mk_params_ret cx type_params_map params (body, ret) in
+
+  let yield, next = if generator then (
+    Flow_js.mk_tvar cx (prefix_reason "yield of " reason),
+    Flow_js.mk_tvar cx (prefix_reason "next of " reason)
+  ) else (
+    MixedT (replace_reason "no yield" reason),
+    MixedT (replace_reason "no next" reason)
+  ) in
 
   let save_return_exn = Abnormal.swap Abnormal.Return false in
   let save_throw_exn = Abnormal.swap Abnormal.Throw false in
@@ -5485,7 +5584,8 @@ and function_decl id cx type_params_map (reason:reason) ~async
       param_types_map |> SMap.map (Flow_js.subst cx map_) in
     let ret = Flow_js.subst cx map_ ret in
 
-    mk_body id cx type_params_map ~async param_types_map param_types_loc ret body this super;
+    mk_body id cx type_params_map ~async ~generator
+      param_types_map param_types_loc ret body this super yield next;
   );
 
   ignore (Abnormal.swap Abnormal.Return save_return_exn);
@@ -5537,8 +5637,8 @@ and define_internal cx reason x =
   let opt = Env_js.get_var_declared_type cx ix reason in
   Env_js.set_var cx ix (Flow_js.filter_optional cx reason opt) reason
 
-and mk_body id cx type_params_map ~async ?(derived_ctor=false)
-    param_types_map param_locs_map ret body this super =
+and mk_body id cx type_params_map ~async ~generator ?(derived_ctor=false)
+    param_types_map param_locs_map ret body this super yield next =
   let ctx =  Env_js.get_scopes () in
   let new_ctx = Env_js.clone_scopes ctx in
   Env_js.update_env cx new_ctx;
@@ -5546,7 +5646,7 @@ and mk_body id cx type_params_map ~async ?(derived_ctor=false)
 
   (* create and prepopulate function scope *)
   let function_scope =
-    let scope = Scope.(if async then fresh_async else fresh) () in
+    let scope = Scope.fresh ~async ~generator () in
     (* add param bindings *)
     param_types_map |> SMap.iter (fun name t ->
       let entry = Scope.Entry.(match SMap.get name param_locs_map with
@@ -5563,8 +5663,12 @@ and mk_body id cx type_params_map ~async ?(derived_ctor=false)
     (* special bindings for this, super, and return value slot *)
     initialize_this_super derived_ctor this super scope;
     Scope.(
-      let entry = Entry.(new_const ~state:Initialized ret) in
-      add_entry (internal_name "return") entry scope
+      let yield_entry = Entry.(new_const ~state:Initialized yield) in
+      let next_entry = Entry.(new_const ~state:Initialized next) in
+      let ret_entry = Entry.(new_const ~state:Initialized ret) in
+      add_entry (internal_name "yield") yield_entry scope;
+      add_entry (internal_name "next") next_entry scope;
+      add_entry (internal_name "return") ret_entry scope
     );
     scope
   in
@@ -5585,8 +5689,12 @@ and mk_body id cx type_params_map ~async ?(derived_ctor=false)
     let loc = loc_of_t ret in
     let void_t = if async then
       let reason = mk_reason "return Promise<Unit>" loc in
-      let promise = Env_js.get_var ~lookup_mode:ForType cx "Promise" reason in
+      let promise = Env_js.var_ref ~lookup_mode:ForType cx "Promise" reason in
       TypeAppT (promise, [VoidT.at loc])
+    else if generator then
+      let reason = mk_reason "return Generator<Yield,void,Next>" loc in
+      let ret = VoidT.at loc in
+      Flow_js.get_builtin_typeapp cx reason "Generator" [yield; ret; next]
     else
       VoidT (mk_reason "return undefined" loc)
     in
@@ -5736,18 +5844,18 @@ and extract_type_param_instantiations = function
   | Some (_, typeParameters) -> typeParameters.Ast.Type.ParameterInstantiation.params
 
 (* Process a function definition, returning a (polymorphic) function type. *)
-and mk_function id cx type_params_map reason ~async type_params params ret body this =
+and mk_function id cx type_params_map reason ~async ~generator type_params params ret body this =
   (* Normally, functions do not have access to super. *)
   let super = MixedT (replace_reason "empty super object" reason) in
   let signature =
-    function_decl id cx type_params_map reason ~async type_params params ret body this super
+    function_decl id cx type_params_map reason ~async ~generator type_params params ret body this super
   in
   mk_function_type cx reason this signature
 
 (* Process an arrow function, returning a (polymorphic) function type. *)
-and mk_arrow id cx type_params_map reason ~async type_params params ret body this super =
+and mk_arrow id cx type_params_map reason ~async ~generator type_params params ret body this super =
   let signature =
-    function_decl id cx type_params_map reason ~async type_params params ret body this super
+    function_decl id cx type_params_map reason ~async ~generator type_params params ret body this super
   in
   (* Do not expose the type of `this` in the function's type. The call to
      function_decl above has already done the necessary checking of `this` in
@@ -5780,9 +5888,9 @@ and mk_function_type cx reason this signature =
 
 (* This function is around for the sole purpose of modeling some method-like
    behaviors of non-ES6 React classes. It is otherwise deprecated. *)
-and mk_method cx type_params_map reason ~async params ret body this super =
+and mk_method cx type_params_map reason ~async ~generator params ret body this super =
   let (_,params,pnames,ret) =
-    function_decl None cx type_params_map ~async reason None params ret body this super
+    function_decl None cx type_params_map ~async ~generator reason None params ret body this super
   in
   FunT (reason, Flow_js.dummy_static, Flow_js.dummy_prototype,
         Flow_js.mk_functiontype2
@@ -5850,9 +5958,8 @@ let cross_module_gc =
 let force_annotations cx =
   let tvar = Flow_js.lookup_module cx cx._module in
   let reason, id = open_tvar tvar in
-  let constraints = Flow_js.find_graph cx id in
   let before = Errors_js.ErrorSet.cardinal cx.errors in
-  Flow_js.enforce_strict cx id constraints;
+  Flow_js.enforce_strict cx id;
   let after = Errors_js.ErrorSet.cardinal cx.errors in
   if (after > before)
   then cx.graph <- cx.graph |>
@@ -5953,30 +6060,33 @@ let infer_ast ast file ?module_name force_check =
     scan_for_suppressions cx comments;
   );
 
-  let module_t = mk_module_t cx reason_exports_module in
-  let module_t = (
-    match cx.module_exports_type with
-    (* CommonJS with a clobbered module.exports *)
-    | CommonJSModule(Some(loc)) ->
-      let module_exports_t = get_module_exports cx reason in
-      let reason = mk_reason "exports" loc in
-      merge_commonjs_export cx reason module_t module_exports_t
+  if checked then (
+    let module_t = mk_module_t cx reason_exports_module in
+    let module_t = (
+      match cx.module_exports_type with
+      (* CommonJS with a clobbered module.exports *)
+      | CommonJSModule(Some(loc)) ->
+        let module_exports_t = get_module_exports cx reason in
+        let reason = mk_reason "exports" loc in
+        merge_commonjs_export cx reason module_t module_exports_t
 
-    (* CommonJS with a mutated 'exports' object *)
-    | CommonJSModule(None) ->
-      merge_commonjs_export cx reason module_t local_exports_var
+      (* CommonJS with a mutated 'exports' object *)
+      | CommonJSModule(None) ->
+        merge_commonjs_export cx reason module_t local_exports_var
 
-    (* Uses standard ES module exports *)
-    | ESModule -> module_t
-  ) in
-  Flow_js.flow cx (module_t, exports cx _module);
+      (* Uses standard ES module exports *)
+      | ESModule -> module_t
+    ) in
+    Flow_js.flow cx (module_t, exports cx _module);
+  ) else (
+    Flow_js.unify cx (exports cx _module) AnyT.t;
+  );
 
   (* insist that whatever type flows into exports is fully annotated *)
   (if modes.strict then force_annotations cx);
 
   let ins = SSet.elements cx.required in
   let out = _module in
-  cx.strict_required <- Flow_js.analyze_dependencies cx ins out;
   if module_name <> None then Flow_js.do_gc cx (out::ins);
 
   cx
@@ -6012,33 +6122,16 @@ let infer_module file =
    So do union N M as long as N may override M for overlapping keys.
 *)
 
-(* aggregate module context data with other module context data *)
-let aggregate_context_data cx cx_other =
+(* Copy context from cx_other to cx *)
+let copy_context cx cx_other =
   cx.closures <-
     IMap.union cx_other.closures cx.closures;
   cx.property_maps <-
     IMap.union cx_other.property_maps cx.property_maps;
   cx.globals <-
-    SSet.union cx_other.globals cx.globals
-
-(* update module graph with other module graph *)
-let update_graph cx cx_other =
-  let _, builtin_id = open_tvar (Flow_js.builtins ()) in
-  let master_node = IMap.find_unsafe builtin_id cx.graph in
-  let master_bounds = bounds_of_unresolved_root master_node in
-  cx_other.graph |> IMap.iter (fun id module_node ->
-    if (id = builtin_id) then (
-      let module_bounds = bounds_of_unresolved_root module_node in
-      master_bounds.uppertvars <- IMap.union
-        module_bounds.uppertvars
-        master_bounds.uppertvars;
-      master_bounds.upper <- TypeMap.union
-        module_bounds.upper
-        master_bounds.upper
-    )
-    else
-      cx.graph <- cx.graph |> IMap.add id module_node
-  )
+    SSet.union cx_other.globals cx.globals;
+  cx.graph <-
+    IMap.union cx_other.graph cx.graph
 
 type direction = Out | In
 
@@ -6060,31 +6153,24 @@ let export_to_master cx m =
 let require_from_master cx m =
   link_module_types Out cx m
 
-(* Copy context from cx_other to cx *)
-let copy_context cx cx_other =
-  aggregate_context_data cx cx_other;
-  update_graph cx cx_other
-
-let copy_context_master cx =
-  copy_context (Flow_js.master_cx ()) cx
-
 (* Connect the builtins object in master_cx to the builtins reference in some
    arbitrary cx. *)
-let implicit_require_strict cx master_cx =
-  let builtins = Flow_js.builtins () in
-  let _, builtin_id = open_tvar builtins in
-  let types = Flow_js.possible_types master_cx builtin_id in
-  types |> List.iter (fun t ->
-    Flow_js.flow cx (t, builtins)
-  )
+let implicit_require_strict cx master_cx cx_to =
+  let from_t = Flow_js.lookup_module master_cx Files_js.lib_module in
+  let to_t = Flow_js.lookup_module cx_to Files_js.lib_module in
+  Flow_js.flow cx (from_t, to_t)
 
 (* Connect the export of cx_from to its import in cx_to. This happens in some
    arbitrary cx, so cx_from and cx_to should have already been copied to cx. *)
-let explicit_impl_require_strict cx (cx_from, cx_to) =
-  let m = cx_from._module in
-  let from_t = Flow_js.lookup_module cx_from m in
+let explicit_impl_require_strict cx (cx_from, r, cx_to) =
+  let from_t =
+    try Flow_js.lookup_module cx_from r
+    with _ ->
+      (* The module exported by cx_from may be imported by path in cx_to *)
+      Flow_js.lookup_module cx_from cx_from._module
+  in
   let to_t =
-    try Flow_js.lookup_module cx_to m
+    try Flow_js.lookup_module cx_to r
     with _ ->
       (* The module exported by cx_from may be imported by path in cx_to *)
       Flow_js.lookup_module cx_to cx_from.file
@@ -6096,38 +6182,76 @@ let explicit_impl_require_strict cx (cx_from, cx_to) =
 let explicit_decl_require_strict cx m cxs_to =
   let reason = reason_of_string m in
   let from_t = Flow_js.mk_tvar cx reason in
+  (* TODO: cache in modulemap *)
   Flow_js.lookup_builtin cx (internal_module_name m) reason None from_t;
   cxs_to |> List.iter (fun cx_to ->
     let to_t = Flow_js.lookup_module cx_to m in
     Flow_js.flow cx (from_t, to_t)
   )
 
-(* Merge context of module with contexts of its implicit requires and explicit
-   requires. The implicit requires are those defined in lib.js (master_cx). For
-   the explicit requires, we need to merge the entire dependency graph: this
-   includes "nodes" (cxs) and edges (implementations and
-   declarations). Intuitively, the operation we really need is "substitution" of
-   known types for unknown type variables. This operation is simulated by the
-   more general procedure of copying and linking graphs. *)
-let merge_module_strict cx cxs implementations declarations master_cx =
+(* Merge a component with its "implicit requires" and "explicit requires." The
+   implicit requires are those defined in libraries. For the explicit
+   requires, we need to merge only those parts of the dependency graph that the
+   component immediately depends on. (We assume that this merging is part of a
+   recursive process that has already handled recursive dependencies.)
+
+   Now, by definition, files in a component can bidirectionally depend only on
+   other files in the component. All other dependencies are unidirectional.
+
+   Let dep_cxs contain the (optimized) contexts of all dependencies that are
+   unidirectional, and let component_cxs contain the contexts of the files in
+   the component. Let master_cx be the (optimized) context of libraries.
+
+   Let implementations contain the dependency edges between contexts in
+   component_cxs and dep_cxs, and declarations contain the dependency edges from
+   component_cxs to master_cx.
+
+   We assume that the first context in component_cxs is that of the leader (cx):
+   this serves as the "host" for the merging. Let the remaining contexts in
+   component_cxs be other_cxs.
+
+   1. Copy dep_cxs, other_cxs, and master_cx to the host cx.
+
+   2. Link the edges in implementations.
+
+   3. Link the edges in declarations.
+
+   4. Link the local references to libraries in master_cx and component_cxs.
+*)
+let merge_component_strict component_cxs dep_cxs
+    implementations declarations master_cx =
+  let cx, other_cxs = List.hd component_cxs, List.tl component_cxs in
   Flow_js.Cache.clear();
 
-  (* First, copy cxs and master_cx to the host cx. *)
-  cxs |> List.iter (copy_context cx);
+  dep_cxs |> List.iter (copy_context cx);
+  other_cxs |> List.iter (copy_context cx);
   copy_context cx master_cx;
 
-  (* Connect links between implementations and requires. Since the host contains
-     copies of all graphs, the links should already be available. *)
   implementations |> List.iter (explicit_impl_require_strict cx);
 
-  (* Connect links between declarations and requires. Since the host contains
-     copies of all graphs, the links should already be available *)
   declarations |> SMap.iter (explicit_decl_require_strict cx);
 
-  (* Connect the builtins object to the builtins reference. Since the builtins
-     reference is shared, this connects the definitions of builtins to their
-     uses in all contexts. *)
-  implicit_require_strict cx master_cx
+  other_cxs |> List.iter (implicit_require_strict cx master_cx);
+  implicit_require_strict cx master_cx cx;
+
+  ()
+
+(* After merging dependencies into a context (but before optimizing the
+   context), it is important to restore the parts of the context that were
+   copied from other, already optimized contexts (dep_cxs and master_cx, see
+   above comment for details on what they mean). Indeed, merging is an
+   imperative process, and there is no guarantee that those parts of the context
+   would have remained unchanged.
+
+   Restoration maintains consistency for "diamond-shaped" dependency relations:
+   it forces two contexts B and C that depend on the same context A to agree on
+   the meaning of the parts of A they share (and that meaning is dictated by A
+   itself), and so some context D that depends on both B and C (and perhaps A
+   too) is never confused when merging them.
+*)
+let restore cx dep_cxs master_cx =
+  dep_cxs |> List.iter (copy_context cx);
+  copy_context cx master_cx
 
 (* variation of infer + merge for lib definitions *)
 let init_lib_file file statements comments save_errors save_suppressions =
@@ -6147,33 +6271,11 @@ let init_lib_file file statements comments save_errors save_suppressions =
     Flow_js.set_builtin cx name (actual_type entry)
   ));
 
-  copy_context_master cx;
+  let master_cx = Flow_js.master_cx () in
+  copy_context master_cx cx;
+  implicit_require_strict master_cx master_cx cx;
 
   let errs = cx.errors in
   cx.errors <- Errors_js.ErrorSet.empty;
   save_errors errs;
   save_suppressions cx.error_suppressions
-
-(* Legacy functions for managing non-strict merges. *)
-(* !!!!!!!!!!! TODO: out of date !!!!!!!!!!!!!!! *)
-
-(* merge module context into master context *)
-let merge_module cx =
-  copy_context_master cx;
-  (* link local and global types for our export and our required's *)
-  export_to_master cx cx._module;
-  SSet.iter (require_from_master cx) cx.required;
-  ()
-
-(* merge all modules at a dependency level, then do xmgc *)
-let merge_module_list cx_list =
-  List.iter merge_module cx_list;
-  let (modules,requires) = cx_list |> ((SSet.empty,SSet.empty) |>
-      List.fold_left (fun (modules,requires) cx ->
-        (SSet.add cx._module modules,
-         SSet.union cx.required requires)
-      )
-  ) in
-  (* cross-module garbage collection *)
-  cross_module_gc (Flow_js.master_cx ()) modules requires;
-  ()

@@ -13,12 +13,17 @@ open Sys_utils
 
 module Json = Hh_json
 
-let version = "0.14.0"
+let version = "0.15.0"
 
 type moduleSystem = Node | Haste
 
+type experimental_feature_mode =
+  | EXPERIMENTAL_IGNORE
+  | EXPERIMENTAL_WARN
+
 type options = {
   enable_unsafe_getters_and_setters: bool;
+  experimental_decorators: experimental_feature_mode;
   moduleSystem: moduleSystem;
   module_name_mappers: (Str.regexp * string) list;
   munge_underscores: bool;
@@ -27,6 +32,7 @@ type options = {
   traces: int;
   strip_root: bool;
   log_file: Path.t;
+  max_workers: int;
 }
 
 module PathMap : MapSig with type key = Path.t
@@ -77,6 +83,7 @@ let default_module_system = Node
 
 let default_options root = {
   enable_unsafe_getters_and_setters = false;
+  experimental_decorators = EXPERIMENTAL_WARN;
   moduleSystem = default_module_system;
   module_name_mappers = [];
   munge_underscores = false;
@@ -85,6 +92,7 @@ let default_options root = {
   traces = 0;
   strip_root = false;
   log_file = default_log_file root;
+  max_workers = Sys_utils.nbr_procs;
 }
 
 module Pp : sig
@@ -377,13 +385,21 @@ module OptionsParser = struct
 
       option_setter options (ln, (left, right))
 
+  let experimental_feature_flag =
+    generic ("warn, ignore", fun value ->
+      match String.trim value with
+      | "ignore" -> Some EXPERIMENTAL_IGNORE
+      | "warn" -> Some EXPERIMENTAL_WARN
+      | _ -> None
+    )
+
   let contains_flag flags flag =
     List.fold_left (fun contains_flag maybe_flag ->
       (maybe_flag = flag) || contains_flag
     ) false flags
 
   let parse_line p (options, seen) (ln, line) =
-    if Str.string_match (Str.regexp "^\\([a-zA-Z._]+\\)=\\(.*\\)$") line 0
+    if Str.string_match (Str.regexp "^\\([a-zA-Z0-9._]+\\)=\\(.*\\)$") line 0
     then
       let opt = Str.matched_group 1 line in
       if SMap.mem opt p
@@ -408,6 +424,13 @@ module OptionsParser = struct
 end
 
 let options_parser = OptionsParser.configure [
+  ("esproposal.decorators", OptionsParser.({
+    flags = [];
+    _parser = experimental_feature_flag (fun opts (_, value) ->
+      { opts with experimental_decorators = value; }
+    );
+  }));
+
   ("suppress_comment", OptionsParser.({
     flags = [ALLOW_DUPLICATE];
     _parser = regexp (fun options (ln, suppress_comment) ->
@@ -469,6 +492,17 @@ let options_parser = OptionsParser.configure [
     _parser = generic
       ("integer", fun s -> try Some (int_of_string s) with _ -> None)
       (fun opts (_, traces) -> { opts with traces });
+  }));
+
+  ("server.max_workers", OptionsParser.({
+    flags = [];
+    _parser = generic
+      ("non-negative integer", fun s ->
+        try
+          let x = int_of_string s in
+          if x < 0 then None else Some x
+        with _ -> None)
+      (fun opts (_, max_workers) -> { opts with max_workers });
   }));
 
   ("strip_root", OptionsParser.({

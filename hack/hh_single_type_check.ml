@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -200,6 +200,9 @@ let parse_options () =
     "--auto-complete",
       Arg.Unit (set_mode Autocomplete),
       "Produce autocomplete suggestions";
+    "--colour",
+      Arg.Unit (set_mode Color),
+      "Produce colour output";
     "--color",
       Arg.Unit (set_mode Color),
       "Produce color output";

@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -83,7 +83,7 @@ module ExprDepTy = struct
    *  } else {
    *    $x = new B(); // Dependent type (`cls '\B')
    *  }
-   *  $x; // Tunresolved[(`cls '\A', `cls '\B')
+   *  $x; // Tunresolved[(`cls '\A', `cls '\B')]
    *
    *  // When we call the function below, we need to generate
    *  // A new expression dependent type since

@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -105,11 +105,12 @@ let collect (effort : [ `gentle | `aggressive ]) =
   hh_collect (effort = `aggressive);
   let new_size = heap_size () in
   let time_taken = Unix.gettimeofday () -. start_t in
-  if old_size <> new_size then
+  if old_size <> new_size then begin
     Hh_logger.log
       "Sharedmem GC: %d bytes before; %d bytes after; in %f seconds"
       old_size new_size time_taken;
-  EventLogger.sharedmem_gc old_size new_size time_taken
+    EventLogger.sharedmem_gc_ran old_size new_size time_taken
+  end
 
 (*****************************************************************************)
 (* Module returning the MD5 of the key. It's because the code in C land

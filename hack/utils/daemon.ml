@@ -74,6 +74,7 @@ end = struct
         name;
     Hashtbl.add entry_points name (Obj.repr f);
     name
+
   let find name =
     try Obj.obj (Hashtbl.find entry_points name)
     with Not_found ->
@@ -106,7 +107,10 @@ type ('param, 'input, 'output) entry = ('param, 'input, 'output) Entry.t
 let exec entry param ic oc =
   let f = Entry.find entry in
   try f param (ic, oc); exit 0
-  with _ -> exit 1
+  with e ->
+    prerr_endline (Printexc.to_string e);
+    Printexc.print_backtrace stderr;
+    exit 2
 
 let register_entry_point = Entry.register
 
@@ -173,10 +177,8 @@ let spawn
           fn)  in
   let out_fd =
     Unix.openfile out_path [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o666 in
-  let pid =
-    Unix.create_process
-      Sys.executable_name [|Sys.executable_name|]
-      null_fd out_fd out_fd in
+  let exe = Sys_utils.executable_path () in
+  let pid = Unix.create_process exe [|exe|] null_fd out_fd out_fd in
   Option.iter reason ~f:(fun reason -> PidLog.log ~reason pid);
   Unix.close child_in;
   Unix.close child_out;

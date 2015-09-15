@@ -76,8 +76,8 @@ module Type :
 
       | CallT of reason * funtype
       | MethodT of reason * name * funtype
-      | SetT of reason * proptype * t
-      | GetT of reason * proptype * t
+      | SetPropT of reason * proptype * t
+      | GetPropT of reason * proptype * t
       | SetElemT of reason * t * t
       | GetElemT of reason * t * t
 
@@ -288,7 +288,9 @@ module Scope: sig
     type state = Undeclared | Declared | Initialized
     val string_of_state: state -> string
 
-    type value_kind = Const | Let | Var
+    type value_kind = Const | Let of implicit_let_kinds option | Var
+    and implicit_let_kinds = ClassNameBinding
+
     val string_of_value_kind: value_kind -> string
 
     type value_binding = {
@@ -310,7 +312,12 @@ module Scope: sig
     | Type of type_binding
 
     val new_var: ?loc:Loc.t -> ?state:state -> ?specific:Type.t -> Type.t -> t
-    val new_let: ?loc:Loc.t -> ?state:state -> Type.t -> t
+    val new_let:
+        ?loc:Loc.t
+        -> ?state:state
+        -> ?implicit:implicit_let_kinds
+        -> Type.t
+        -> t
     val new_const: ?loc:Loc.t -> ?state:state -> Type.t -> t
     val new_type: ?loc:Loc.t -> ?state:state -> Type.t -> t
 
@@ -335,7 +342,8 @@ module Scope: sig
   = Key.t
 
   type var_scope_attrs = {
-    async: bool
+    async: bool;
+    generator: bool
   }
 
   type kind =
@@ -354,8 +362,7 @@ module Scope: sig
     mutable refis: refi_binding KeyMap.t
   }
 
-  val fresh: unit -> t
-  val fresh_async: unit -> t
+  val fresh: ?async:bool -> ?generator:bool -> unit -> t
   val fresh_lex: unit -> t
   val clone: t -> t
 
@@ -402,9 +409,6 @@ type context = {
   (* map from module names to their types *)
   mutable modulemap: Type.t SMap.t;
 
-  (* A subset of required modules on which the exported type depends *)
-  mutable strict_required: SSet.t;
-
   mutable errors: Errors_js.ErrorSet.t;
   mutable globals: SSet.t;
 
@@ -413,6 +417,7 @@ type context = {
   type_table: (Loc.t, Type.t) Hashtbl.t;
   annot_table: (Loc.t, Type.t) Hashtbl.t;
 }
+
 and module_exports_type =
   | CommonJSModule of Loc.t option
   | ESModule
@@ -467,6 +472,8 @@ val loc_of_predicate: Type.predicate -> Loc.t
 
 class ['a] type_visitor: object
   (* Only exposing a few methods for now. *)
-  method type_: context -> 'a -> Type.t -> 'a
-  method id_: context -> 'a -> ident -> 'a
+  method type_ : context -> 'a -> Type.t -> 'a
+  method id_ : context -> 'a -> ident -> 'a
+  method props : context -> 'a -> ident -> 'a
+  method fun_type : context -> 'a -> Type.funtype -> 'a
 end

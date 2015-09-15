@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -53,21 +53,22 @@ let (process_fsnotify_event:
   dirty
 
 let run_daemon roots (ic, oc) =
+  Printexc.record_backtrace true;
   let roots = List.map roots Path.to_string in
   let env = DfindEnv.make roots in
   List.iter roots (DfindAddFile.path env);
   let acc = ref SSet.empty in
   let descr_in = Daemon.descr_of_in_channel ic in
+  let fsnotify_callback events =
+    acc := List.fold_left events ~f:(process_fsnotify_event env) ~init:!acc
+  in
+  let message_in_callback () =
+    (* XXX can we just select() on the writability of the oc? *)
+    let () = Daemon.from_channel ic in
+    Daemon.to_channel oc !acc;
+    acc := SSet.empty
+  in
   while true do
-    let fsnotify_callback events =
-      acc := List.fold_left events ~f:(process_fsnotify_event env) ~init:!acc
-    in
-    let message_in_callback () =
-      (* XXX can we just select() on the writability of the oc? *)
-      let () = Daemon.from_channel ic in
-      Daemon.to_channel oc !acc;
-      acc := SSet.empty
-    in
     let read_fdl = [(descr_in, message_in_callback)] in
     let timeout = -1.0 in
     Fsnotify.select env.fsnotify ~read_fdl ~timeout fsnotify_callback

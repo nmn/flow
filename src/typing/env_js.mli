@@ -20,6 +20,7 @@ val get_scopes: unit -> Scope.t list
 val clone_scopes: Scope.t list -> Scope.t list
 
 val in_async_scope: unit -> bool
+val in_generator_scope: unit -> bool
 
 val all_entries: unit -> Entry.t SMap.t
 
@@ -47,6 +48,14 @@ val update_env: context -> Scope.t list -> unit
 
 val bind_var: ?state:Entry.state -> context -> string -> Type.t -> Loc.t -> unit
 val bind_let: ?state:Entry.state -> context -> string -> Type.t -> Loc.t -> unit
+val bind_implicit_let:
+  ?state:Entry.state
+    -> Entry.implicit_let_kinds
+    -> context
+    -> string
+    -> Type.t
+    -> Loc.t
+    -> unit
 val bind_const: ?state:Entry.state -> context -> string -> Type.t -> Loc.t -> unit
 val bind_type: context -> string -> Type.t -> Loc.t -> unit
 
@@ -55,9 +64,23 @@ val bind_declare_fun: context -> string -> Type.t -> reason -> unit
 
 val declare_const: context -> string -> reason -> unit
 val declare_let: context -> string -> reason -> unit
+val declare_implicit_let:
+  Entry.implicit_let_kinds
+    -> context
+    -> string
+    -> reason
+    -> unit
 
 val init_var: context -> string -> has_anno:bool -> Type.t -> reason -> unit
 val init_let: context -> string -> has_anno:bool -> Type.t -> reason -> unit
+val init_implicit_let:
+  Entry.implicit_let_kinds
+    -> context
+    -> string
+    -> has_anno:bool
+    -> Type.t
+    -> reason
+    -> unit
 val init_const: context -> string -> has_anno:bool -> Type.t -> reason -> unit
 val init_type: context -> string -> Type.t -> reason -> unit
 

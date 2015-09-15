@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -16,7 +16,7 @@ let init_hack genv env get_next =
 
   let t = Unix.gettimeofday () in
   let files_info, errorl1, failed1 =
-      Parsing_service.go genv.workers ~get_next in
+    Parsing_service.go genv.workers ~get_next in
   let hs = SharedMem.heap_size () in
   Hh_logger.log "Heap size: %d" hs;
   Stats.(stats.init_parsing_heap_size <- hs);
